@@ -23,7 +23,7 @@ The OVAL framework currently includes the following incomplete verifiers for pie
 - Beta-CROWN ([Wang et al. 2021](https://arxiv.org/abs/2103.06624)), a state-of-the-art solver for the Planet relaxation (`Propagation` in `plnn/proxlp_solver/propagation.py`).
 - DeepVerify ([Dvijotham et al. 2018](https://arxiv.org/abs/1803.06567)) (`DJRelaxationLP` in `plnn/proxlp_solver/dj_relaxation.py`).
 #### Tighter bounds
-- Active Set and Saddle Point ([De Palma et al. 2021a](https://arxiv.org/abs/2101.05844)), state-of-the-art fast dual solvers for the tighter linear relaxation by 
+- Active Set ([De Palma et al. 2021c](https://openreview.net/forum?id=uQfOy7LrlTR)), and Saddle Point ([De Palma et al. 2021a](https://arxiv.org/abs/2101.05844)), state-of-the-art fast dual solvers for the tighter linear relaxation by 
 [Anderson et al. (2020)](https://arxiv.org/abs/1811.01988) (`ExpLP` in `plnn/explp_solver/solver.py`).
 - Gurobi cutting-plane solver for the relaxation by [Anderson et al. (2020)](https://arxiv.org/abs/1811.01988) 
 (`AndersonLinearizedNetwork` in `plnn/anderson_linear_approximation.py`).
@@ -59,6 +59,10 @@ The OVAL framework was developed as part of the following publications:
 - ["Scaling the Convex Barrier with Active Sets"](https://openreview.net/forum?id=uQfOy7LrlTR);
 - ["Scaling the Convex Barrier with Sparse Dual Algorithms"](https://arxiv.org/abs/2101.05844);
 - ["Improved Branch and Bound for Neural Network Verification via Lagrangian Decomposition"](https://arxiv.org/abs/2104.06718).
+
+If you use our code in your research, please cite the papers associated to the employed algorithms, along with 
+([Bunel et al. 2020a](http://www.jmlr.org/papers/v21/19-468.html)) and 
+([De Palma et al. 2021b](https://arxiv.org/abs/2104.06718)) for the BaB framework.
 
 Additionally, learning-based algorithms for branching and upper bounding (not included in the framework) were presented in:
 - ["Neural Network Branching for Neural Network Verification"](https://arxiv.org/abs/1912.01329);

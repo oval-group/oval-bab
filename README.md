@@ -85,21 +85,22 @@ In addition, code to run the framework on the OVAL and COLT datasets from VNNCOM
 The code was implemented assuming to be run under `python3.6`.
 We assume the user's Python environment is based on Anaconda.
 
+Installation steps (see also `vnncomp_scripts/install_tool.sh`):
 ```bash
 git clone --recursive https://github.com/oval-group/oval-bab.git
 
 cd oval-bab
 
-#Create a conda environment
-conda create -n oval-bab python=3.6
-conda activate oval-bab
+# Create a conda environment
+conda create -y -n oval python=3.6
+conda activate oval
 
 # Install pytorch to this virtualenv
 # (or check updated install instructions at http://pytorch.org)
-conda install pytorch torchvision cudatoolkit -c pytorch 
+conda install -y pytorch torchvision cudatoolkit -c pytorch 
 
 # Install the code of this repository
-python setup.py install
+pip install .
 ```
 
 #### Optional: Gurobi

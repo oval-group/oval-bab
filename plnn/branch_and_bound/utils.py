@@ -180,6 +180,9 @@ def dump_domains_to_file(domains, dumped_domain_filelblist, max_domains_cpu, blo
     file_base = f"block_pid{os.getpid()}_"
     if len(domains) >= max_domains_cpu:
         if not os.path.exists(dumping_folder):
+            if not os.access(dumping_folder, os.W_OK):
+                # If there is no write access to the dumping_folder, use the project directory instead
+                dumping_folder = "./current_domain_files/"
             os.makedirs(dumping_folder)
         c_block = len(dumped_domain_filelblist)
         filename = dumping_folder + file_base + f"{c_block}"

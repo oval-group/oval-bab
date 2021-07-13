@@ -40,10 +40,11 @@ Incomplete verifiers of different bounding tightness and cost can be combined by
 
 ### Branching Strategies for Complete Verification
 
-Subdomains are created by splitting piecewise-linear activations into their linear components. The following two branching
+Subdomains are created by splitting the input domain or by splitting piecewise-linear activations into their linear components. The following two branching
 strategies are available (`plnn/branch_and_bound/branching_scores.py`):
-- The SR heuristic from BaBSR ([Bunel et al. 2020a](http://www.jmlr.org/papers/v21/19-468.html)).
-- FSB ([De Palma et al. 2021b](https://arxiv.org/abs/2104.06718)): a state-of-the-art branching strategy combining SR with inexpensive strong branching to significantly reduce verification times.  
+- The inexpensive input splitting heuristic from "BaB" in [Bunel et al. (2020a)](http://www.jmlr.org/papers/v21/19-468.html).
+- The SR activation splitting heuristic from from "BaBSR" in [Bunel et al. (2020a)](http://www.jmlr.org/papers/v21/19-468.html).
+- FSB ([De Palma et al. 2021b](https://arxiv.org/abs/2104.06718)): a state-of-the-art activation splitting strategy combining SR with inexpensive strong branching to significantly reduce verification times.  
  
 ### Falsification Algorithms (upper bounding)
 

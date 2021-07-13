@@ -16,7 +16,7 @@ class ReLUDomain:
     the lower bound estimated for the instances.
     """
     def __init__(self, lb, ub, lb_all, up_all, parent_solution=None,
-                 parent_ub_point=None, parent_depth=0, c_imp=0, c_imp_avg=0, dec_thr=0, hard_info=None):
+                 parent_ub_point=None, parent_depth=0, c_imp=0, c_imp_avg=0, dec_thr=0, hard_info=None, domain=None):
         self.lower_bound = lb
         self.upper_bound = ub
         self.lower_all = lb_all
@@ -24,6 +24,7 @@ class ReLUDomain:
         self.parent_solution = parent_solution
         self.parent_ub_point = parent_ub_point
         self.depth = parent_depth + 1
+        self.domain = domain
 
         # keep running improvement average
         avg_coeff = 0.5
@@ -52,6 +53,8 @@ class ReLUDomain:
             self.parent_solution.to_cpu()
         if self.parent_ub_point is not None:
             self.parent_ub_point = self.parent_ub_point.cpu()
+        if self.domain is not None:
+            self.domain.cpu()
         return self
 
     def to_device(self, device):
@@ -64,6 +67,8 @@ class ReLUDomain:
             self.parent_solution.to_device(device)
         if self.parent_ub_point is not None:
             self.parent_ub_point = self.parent_ub_point.to(device)
+        if self.domain is not None:
+            self.domain.to(device)
         return self
 
 
@@ -199,7 +204,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
 
     candidate_domain = ReLUDomain(global_lb, global_ub, intermediate_lbs, intermediate_ubs,
                                   parent_solution=bounds_net.children_init,
-                                  dec_thr=decision_bound, hard_info=next_net_info).to_cpu()
+                                  dec_thr=decision_bound, hard_info=next_net_info, domain=domain.unsqueeze(0)).to_cpu()
 
     domains = [candidate_domain]
     dumped_domain_filelblist = []  # store filenames and lbs for blocks of domains that are stored on disk
@@ -248,7 +253,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
             # candidate_domain = bab.pick_out(domains, global_ub.cpu() - eps).to_device(intermediate_net_device)
             candidate_domain = bab.pick_out(domains, global_ub.cpu() - eps).to_device(intermediate_net_device)
             # Populate the batch of subproblems for batched branching
-            bab.set_subproblem_stacks_entry(batch_idx, domain_stack, lbs_stacks, ubs_stacks, domain,
+            bab.set_subproblem_stacks_entry(batch_idx, domain_stack, lbs_stacks, ubs_stacks, candidate_domain.domain,
                                             candidate_domain.lower_all, candidate_domain.upper_all)
 
             # collect branching related information
@@ -265,7 +270,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
             if get_testnode:
                 # Use as test node the first picked node with a depth of 4 (this way split constraints are represented)
                 # If stratifying, it's applied only to the tighter bounding algorithm
-                testnode_dict = {"domain": domain.unsqueeze(0), "intermediate_lbs": candidate_domain.lower_all,
+                testnode_dict = {"domain": candidate_domain.domain, "intermediate_lbs": candidate_domain.lower_all,
                                  "intermediate_ubs": candidate_domain.upper_all}
                 if out_bounds_dict["parent_init"]:
                     testnode_dict["pinit"] = candidate_domain.parent_solution
@@ -273,8 +278,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                 # Bounding improvement estimations for automatic number of bounds iterations, and for stratified bounds
                 # Automatic number of iterations.
                 tighter_lb = bab.assess_impr_margin(
-                    bounds_net, domain.unsqueeze(0), candidate_domain.lower_all, candidate_domain.upper_all, net_info,
-                    intermediate_dict, c_lb=candidate_domain.lower_bound)
+                    bounds_net, candidate_domain.domain, candidate_domain.lower_all, candidate_domain.upper_all,
+                    net_info, intermediate_dict, c_lb=candidate_domain.lower_bound)
                 net_info["+iters_lb"] = tighter_lb
 
             # Stratified bounding related.
@@ -289,13 +294,13 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                 if not gurobi:
                     bounds_net.initialize_from(copy.deepcopy(candidate_domain.parent_solution))
                     bounds_net.build_model_using_bounds(
-                        domain.unsqueeze(0), (candidate_domain.lower_all, candidate_domain.upper_all))
+                        candidate_domain.domain, (candidate_domain.lower_all, candidate_domain.upper_all))
                     next_net_info["net"].initialize_from(copy.deepcopy(candidate_domain.parent_solution))
                     next_net_info["net"].build_model_using_bounds(
-                        domain.unsqueeze(0), (candidate_domain.lower_all, candidate_domain.upper_all))
+                        candidate_domain.domain, (candidate_domain.lower_all, candidate_domain.upper_all))
                 else:
                     cpu_domain, cpu_intermediate_lbs, cpu_intermediate_ubs = bab.subproblems_to_cpu(
-                        domain.unsqueeze(0), candidate_domain.lower_all, candidate_domain.upper_all,
+                        candidate_domain.domain, candidate_domain.lower_all, candidate_domain.upper_all,
                         squeeze=True)
                     next_net_info["net"].build_model_using_bounds(
                         cpu_domain, (cpu_intermediate_lbs, cpu_intermediate_ubs))
@@ -385,13 +390,13 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                         c_dom_ub_all, parent_solution=c_dual_solutions,
                         parent_depth=depth_list[batch_idx], c_imp_avg=impr_avg_list[batch_idx],
                         c_imp=dom_lb[batch_idx].item() - parent_lb_list[batch_idx].item(), dec_thr=decision_bound,
-                        hard_info=next_net_info
+                        hard_info=next_net_info, domain=domain_stack[batch_idx].unsqueeze(0)
                     ).to_cpu()
                 else:
                     dom_to_add = ReLUDomain(
                         dom_lb[batch_idx].unsqueeze(0), dom_ub[batch_idx].unsqueeze(0),
                         c_dom_lb_all, c_dom_ub_all, parent_solution=c_dual_solutions,
-                        parent_depth=depth_list[batch_idx]).to_cpu()
+                        parent_depth=depth_list[batch_idx], domain=domain_stack[batch_idx].unsqueeze(0)).to_cpu()
 
                 # if the problem is hard, add "difficult" domains to the hard queue
                 if next_net_info and bab.is_difficult_domain(dom_to_add, next_net_info, expansion=expans_factor):

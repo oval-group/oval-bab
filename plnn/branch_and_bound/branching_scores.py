@@ -20,7 +20,7 @@ class BranchingChoice:
                 self.__dict__[key] = branch_dict[key]["net"]
             else:
                 self.__dict__[key] = branch_dict[key]
-        if self.heuristic_type not in ["SR", "FSB"]:
+        if self.heuristic_type not in ["SR", "FSB", "input"]:
             raise NotImplementedError(f"Branching heuristic {self.heuristic_type} not implemented.")
 
         # Set other parameters.
@@ -34,11 +34,11 @@ class BranchingChoice:
             self.decision_threshold = 0.001
 
         # Set the branching function.
-        branching_function_dict = {"SR": self.branch_sr, "FSB": self.branch_fsb}
+        branching_function_dict = {"SR": self.branch_sr, "FSB": self.branch_fsb, "input": self.branch_input_bab}
         self.branching_function = branching_function_dict[self.heuristic_type]
 
         # Set the splitting function.
-        splitting_function_dict = {"SR": self.relu_split, "FSB": self.relu_split}
+        splitting_function_dict = {"SR": self.relu_split, "FSB": self.relu_split, "input": self.input_split}
         self.splitting_function = splitting_function_dict[self.heuristic_type]
 
     def branch(self, domains, lower_bounds, upper_bounds):
@@ -333,3 +333,22 @@ class BranchingChoice:
             else:
                 # passing ReLU obtained by setting the pre-activation LB to 0
                 splitted_lbs_stacks[change_idx][batch_idx].view(-1)[decision[1]] = split_point
+
+    def branch_input_bab(self, domains, lower_bounds, upper_bounds):
+        # do input splitting along max dimension
+        split_indices = torch.argmax((domains.select(-1, 1) - domains.select(-1, 0)).view(lower_bounds[0].shape[0], -1),
+                                     dim=-1)
+        return [(-1, csplit) for csplit in split_indices]
+
+    @staticmethod
+    def input_split(decision, choice, batch_idx, domains, splitted_lbs_stacks, splitted_ubs_stacks):
+        if decision is not None:
+            half_point = ((domains.select(-1, 1).view(splitted_lbs_stacks[0].shape[0], -1)[batch_idx, decision[1]] +
+                           domains.select(-1, 0).view(splitted_lbs_stacks[0].shape[0], -1)[batch_idx, decision[1]]) / 2)
+            # Split ambiguous ReLUs at 0 so as to get two linear functions, halve the domains of non-ambiguous ReLUs.
+            if choice == 0:
+                # blocking ReLU obtained by setting the pre-activation UB to 0
+                domains.select(-1, 1).view(splitted_lbs_stacks[0].shape[0], -1)[batch_idx, decision[1]] = half_point
+            else:
+                # passing ReLU obtained by setting the pre-activation LB to 0
+                domains.select(-1, 0).view(splitted_lbs_stacks[0].shape[0], -1)[batch_idx, decision[1]] = half_point

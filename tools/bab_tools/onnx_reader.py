@@ -175,6 +175,15 @@ def rebuild_relu(node, weights):
     return nn.ReLU(), node.input, node.output
 
 
+def rebuild_max(node, weights):
+    # Only support max operators that incode ReLUs.
+    assert (node.input[1] in weights) or (node.input[0] in weights)
+    const_input = next(filter(lambda x: x in weights, node.input))
+    assert weights[const_input].sum() == 0
+    nonconst_input = next(filter(lambda x: x not in weights, node.input))
+    return nn.ReLU(), [nonconst_input], node.output
+
+
 def rebuild_sigmoid(node, weights):
     return nn.Sigmoid(), node.input, node.output
 
@@ -228,8 +237,14 @@ def rebuild_flatten(node, weights):
 def rebuild_gemm(node, weights):
     weight = weights[node.input[1]]
     bias = weights[node.input[2]]
-    in_feats = weight.shape[1]
-    out_feats = weight.shape[0]
+    trans_b = list(filter(lambda x: x.name == "transB", node.attribute))[0].i
+    if not trans_b:
+        in_feats = weight.shape[0]
+        out_feats = weight.shape[1]
+        weight = weight.t()
+    else:
+        in_feats = weight.shape[1]
+        out_feats = weight.shape[0]
     linear = nn.Linear(in_features=in_feats, out_features=out_feats)
     linear.weight.data = weight
     linear.bias.data = bias
@@ -367,6 +382,7 @@ def rebuild_op(node, weights):
 
 
 def construct_pytorch_nodes(graph, weights):
+    # NOTE: assumes absence of residual connections, that the bias changes only according to output channels
     graph_dict = {}
     for cnode in graph.node:
         for out_name in cnode.output:
@@ -377,7 +393,7 @@ def construct_pytorch_nodes(graph, weights):
         matmul_wo_bias = None
         if single_node.op_type.lower() == "add":
             for cinput in single_node.input:
-                if cinput in graph_dict and graph_dict[cinput].op_type.lower() == "matmul":
+                if cinput in graph_dict and graph_dict[cinput].op_type.lower() in ["matmul", "conv"]:
                     matmul_wo_bias = cinput
                     break
             if matmul_wo_bias is not None:
@@ -387,8 +403,20 @@ def construct_pytorch_nodes(graph, weights):
             ret[key] = rebuild_op(single_node, weights)
 
     for missing_bias, matmul_name in missing_biases:
-        # Add add as bias of Linear operator
-        ret[matmul_name][0].bias.data = weights[missing_bias.input[1]]
+        if ret[matmul_name][0].bias is None:
+            # Add add as bias of Conv2d operator -- PyTorch only supports 1D biases so the other dims are averaged
+            bias = weights[missing_bias.input[1]]
+            if bias.shape != (ret[matmul_name][0].weight.shape[0],):
+                if len(bias.shape) == 4:
+                    # average batch dimension (assumes it's a conversion artifact)
+                    bias = bias.mean(dim=0)
+                # NOTE: assumes the two trailing dimensions are conversion artifacts
+                assert len(bias.shape) == 3
+                bias = bias.mean(dim=(-1, -2))
+            ret[matmul_name][0].bias = nn.Parameter(bias)
+        else:
+            # Add add as bias of Linear operator
+            ret[matmul_name][0].bias.data = weights[missing_bias.input[1]]
         ret[matmul_name] = (ret[matmul_name][0], ret[matmul_name][1], missing_bias.output)
 
     return ret

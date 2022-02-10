@@ -128,7 +128,8 @@ def rebuild_conv(node, weights):
     out_channels = weight.shape[0]
     kwargs = {}
 
-    assert list(filter(lambda x: x.name == "auto_pad", node.attribute))[0].s == "NOTSET", "auto_pad not supported"
+    if len(list(filter(lambda x: x.name == "auto_pad", node.attribute))) > 0:
+        assert list(filter(lambda x: x.name == "auto_pad", node.attribute))[0].s == b"NOTSET", "auto_pad not supported"
     # Ignore spurious auto_pad attributes that are not doing anything ("NOTSET").
     attributes = filter(lambda x: x.name != "auto_pad", node.attribute)
 

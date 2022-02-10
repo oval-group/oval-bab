@@ -374,7 +374,7 @@ def reluified_max_pool(candi_tot, lb_abs, flip_out_sign=False, dtype=torch.float
     return layers
 
 
-def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000):
+def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000, use_ib=False):
     """
         Given a pre-trained PyTorch network given by model, the true_label (ground truth) and the input domain for the
         property, create a network encoding a 1 vs. all adversarial verification task.
@@ -387,7 +387,7 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
 
     last_layer = layers[-1]
     diff_in = last_layer.out_features
-    diff_out = last_layer.out_features-1
+    diff_out = last_layer.out_features - 1
     diff_layer = nn.Linear(diff_in, diff_out, bias=True)
     temp_weight_diff = torch.eye(10)
     temp_weight_diff[:, true_label] -= 1
@@ -395,16 +395,20 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
     all_indices.remove(true_label)
     weight_diff = temp_weight_diff[all_indices]
     bias_diff = torch.zeros(9)
-    
+
     diff_layer.weight = Parameter(weight_diff, requires_grad=False)
     diff_layer.bias = Parameter(bias_diff, requires_grad=False)
     layers.append(diff_layer)
     layers = simplify_network(layers)
 
     cuda_verif_layers = [copy.deepcopy(lay).cuda() for lay in layers]
-    # use best of naive interval propagation and KW as intermediate bounds
-    intermediate_net = Propagation(cuda_verif_layers, max_batch=max_solver_batch, type="best_prop",
-                                   params={"best_among": ["KW", "crown"]})
+    if not use_ib:
+        # use best of CROWN and KW as intermediate bounds
+        intermediate_net = Propagation(cuda_verif_layers, max_batch=max_solver_batch, type="best_prop",
+                                       params={"best_among": ["KW", "crown"]})
+    else:
+        # use IBP for intermediate bounds
+        intermediate_net = Propagation(cuda_verif_layers, max_batch=max_solver_batch, type="naive")
     intermediate_net.define_linear_approximation(domain.cuda().unsqueeze(0))
     lbs = intermediate_net.lower_bounds[-1].squeeze(0).cpu()
 
@@ -414,11 +418,12 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
     max_pool_layers = reluified_max_pool(candi_tot, lbs, flip_out_sign=True)
 
     # simplify linear layers
-    simp_required_layers = layers[-1:]+max_pool_layers
+    simp_required_layers = layers[-1:] + max_pool_layers
     simplified_layers = simplify_network(simp_required_layers)
 
-    final_layers = layers[:-1]+simplified_layers
+    final_layers = layers[:-1] + simplified_layers
     return final_layers
+
 
 def normalize(image, dataset):
     mean, sigma = get_mean_sigma(dataset)

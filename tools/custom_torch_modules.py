@@ -1,5 +1,6 @@
 from torch import nn
 import torch
+import numpy as np
 
 
 class Flatten(nn.Module):
@@ -60,6 +61,10 @@ class Reshape(nn.Module):
         self.out_shape = out_shape
 
     def forward(self, inp):
+        # Handle failing reshapes because of mismatched batch sizes at construction.
+        if np.prod(inp.shape) != np.prod(self.out_shape):
+            if inp.shape[0] != self.out_shape[0]:
+                self.out_shape = (-1, *self.out_shape[1:])
         self.in_shape = (-1, *inp.shape[1:])
         out = inp.reshape(self.out_shape)
         return out

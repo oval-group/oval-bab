@@ -127,7 +127,12 @@ def rebuild_conv(node, weights):
     in_channels = weight.shape[1]
     out_channels = weight.shape[0]
     kwargs = {}
-    for att in node.attribute:
+
+    assert list(filter(lambda x: x.name == "auto_pad", node.attribute))[0].s == "NOTSET", "auto_pad not supported"
+    # Ignore spurious auto_pad attributes that are not doing anything ("NOTSET").
+    attributes = filter(lambda x: x.name != "auto_pad", node.attribute)
+
+    for att in attributes:
         kwargs[rebuild_conv.conv_attr_map[att.name]] = list(att.ints) if att.name != 'group' else att.i
     if 'padding' in kwargs:
         kwargs["padding"] = _slim422(kwargs["padding"])

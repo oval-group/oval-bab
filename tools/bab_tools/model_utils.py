@@ -409,7 +409,7 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
     else:
         # use IBP for intermediate bounds
         intermediate_net = Propagation(cuda_verif_layers, max_batch=max_solver_batch, type="naive")
-    intermediate_net.define_linear_approximation(domain.cuda().unsqueeze(0))
+    intermediate_net.define_linear_approximation(domain.cuda().unsqueeze(0), override_numerical_errors=True)
     lbs = intermediate_net.lower_bounds[-1].squeeze(0).cpu()
 
     candi_tot = diff_out

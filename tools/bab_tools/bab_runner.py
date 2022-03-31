@@ -344,6 +344,8 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
     parse_bounding_algorithms(json_params, cuda_verif_layers, nn_name)
     max_cpu_domains = json_params["bab"]["max_cpu_subdomains"] \
         if "bab" in json_params and "max_cpu_subdomains" in json_params["bab"] else None
+    early_terminate = json_params["bab"]["early_terminate"] \
+        if "bab" in json_params and "early_terminate" in json_params["bab"] else False
     intermediate_dict = json_params["ibs"]
     out_bounds_dict = json_params["bounding"]
     branching_dict = json_params["branching"]
@@ -363,8 +365,8 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
 
     with torch.no_grad():
         min_lb, min_ub, ub_point, nb_states = relu_bab(
-            intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=epsilon,
-            ub_method=adv_model, timeout=timeout, max_cpu_subdomains=max_cpu_domains, start_time=start_time)
+            intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=epsilon, ub_method=adv_model,
+            timeout=timeout, max_cpu_subdomains=max_cpu_domains, start_time=start_time, early_terminate=early_terminate)
 
     if not (min_lb or min_ub or ub_point):
         return_dict["min_lb"] = None;

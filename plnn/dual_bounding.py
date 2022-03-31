@@ -8,6 +8,8 @@ from plnn.proxlp_solver.utils import BatchLinearOp, BatchConvOp, get_relu_mask, 
     create_final_coeffs_slice, LinearOp, ConvOp, prod, apply_transforms, CompositeLinearOp
 from tools.custom_torch_modules import supported_transforms, shape_transforms, math_transforms
 
+numerical_tolerance = 1e-5
+
 
 class DualBounding(LinearizedNetwork):
     """
@@ -248,6 +250,11 @@ class DualBounding(LinearizedNetwork):
                 u_0 = self.input_domain.select(-1, 1)
                 l_1, u_1, cond_first_linear = self.build_first_conditioned_layer(l_0, u_0, layer, no_conv)
 
+                if override_numerical_errors:
+                    u_1 = torch.where((u_1 - l_1 <= 0) & (u_1 - l_1 >= -numerical_tolerance),
+                                      l_1 + numerical_tolerance, u_1)
+                assert (u_1 - l_1).min() >= 0, "Incompatible bounds"
+
                 if no_conv:
                     # when linearizing conv layers, we need to keep track of the original shape of the bounds
                     self.original_shape_lbs = [-torch.ones_like(l_0), l_1]
@@ -441,11 +448,10 @@ class DualBounding(LinearizedNetwork):
         lbs = lbs.view(batch_size, *out_shape)
         ubs = ubs.view(batch_size, *out_shape)
 
-        if not override_numerical_errors:
-            assert (ubs - lbs).min() >= 0, "Incompatible bounds"
-        else:
-            ubs = torch.where((ubs - lbs <= 0) & (ubs - lbs >= -1e-5), lbs + 1e-5, ubs)
-            assert (ubs - lbs).min() >= 0, "Incompatible bounds"
+        if override_numerical_errors:
+            ubs = torch.where(
+                (ubs - lbs <= 0) & (ubs - lbs >= -numerical_tolerance), lbs + numerical_tolerance, ubs)
+        assert (ubs - lbs).min() >= 0, "Incompatible bounds"
 
         return lbs, ubs
 

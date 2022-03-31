@@ -72,8 +72,9 @@ class ReLUDomain:
         return self
 
 
-def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=1e-4,
-             ub_method=None, timeout=float("inf"), gurobi_dict=None, max_cpu_subdomains=None, start_time=None):
+def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=1e-4, early_terminate=False,
+             ub_method=None, timeout=float("inf"), gurobi_dict=None, max_cpu_subdomains=None, start_time=None,
+             return_bounds_if_timeout=False):
     '''
     Uses branch and bound algorithm to evaluate the global minimum
     of a given neural network. Splits according to KW.
@@ -94,6 +95,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
     `batch_size`: The number of domain lower/upper bounds computations done in parallel at once (on a GPU) is
                     batch_size*2
     `gurobi_dict`: dictionary containing whether ("gurobi") gurobi needs to be used (executes on "p" cpu)
+    `early_terminate`: use heuristic for early termination in case of almost certain timeout
     'max_cpu_subdomains': how many subdomains we can store in cpu memory
     Returns         : Lower bound and Upper bound on the global minimum,
                       as well as the point where the upper bound is achieved
@@ -134,6 +136,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         intermediate_dict["loose_ib"] = {"net": bounds_net}
     intermediate_net = intermediate_dict["loose_ib"]["net"]
     intermediate_net.define_linear_approximation(domain.unsqueeze(0))
+    intermediate_net.define_linear_approximation(domain.unsqueeze(0), override_numerical_errors=True)
 
     assert intermediate_net.lower_bounds[-1].shape[-1] == 1, "Expecting network to have a single scalar output."
 
@@ -220,7 +223,10 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         if (time.time() - start_time) + 1.10 * (bound_time + branch_time) > timeout:
             bab.join_children(gurobi_dict, timeout)
             bab.delete_dumped_domains(dumped_domain_filelblist)
-            return None, None, None, nb_visited_states
+            if return_bounds_if_timeout:
+                return global_lb, global_ub, None, nb_visited_states
+            else:
+                return None, None, None, nb_visited_states
 
         domains_str = f"Number of domains {len(domains)}"
         domains_str += f" Number of harder domains {len(harder_domains)}" if stratified_bab else ""
@@ -473,6 +479,18 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                 else:
                     # Postpone adding to the harder queue for expected_batches batches.
                     next_net_info["postpone_batches"] = expected_batches
+
+        # If early_terminate is True, we return early if we predict that the property won't be verified within the time
+        # (if the estimated time to cross the decision threshold + to deplete the bounds goes over the timeout)
+        t_to_timeout = timeout - (time.time() - start_time)
+        if early_terminate and n_iter > 5 and \
+                ((decision_bound - global_lb) / expected_improvement + len(domains) / batch_size >
+                 t_to_timeout / bound_time):
+            print(
+                f'early timeout with expected improvement: {expected_improvement} with {t_to_timeout} [s] remaining.')
+            bab.join_children(gurobi_dict, timeout)
+            bab.delete_dumped_domains(dumped_domain_filelblist)
+            return None, None, None, nb_visited_states
 
         # run attacks
         # Try falsification only in the first 50 batch iterations. TODO: better UB heuristic?

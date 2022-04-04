@@ -135,7 +135,6 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
     if "use_lb" in intermediate_dict and intermediate_dict["use_lb"]:
         intermediate_dict["loose_ib"] = {"net": bounds_net}
     intermediate_net = intermediate_dict["loose_ib"]["net"]
-    intermediate_net.define_linear_approximation(domain.unsqueeze(0))
     intermediate_net.define_linear_approximation(domain.unsqueeze(0), override_numerical_errors=True)
 
     assert intermediate_net.lower_bounds[-1].shape[-1] == 1, "Expecting network to have a single scalar output."

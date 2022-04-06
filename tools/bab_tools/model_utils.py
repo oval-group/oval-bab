@@ -374,7 +374,7 @@ def reluified_max_pool(candi_tot, lb_abs, flip_out_sign=False, dtype=torch.float
     return layers
 
 
-def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000, use_ib=False):
+def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000, use_ib=False, gpu=True):
     """
         Given a pre-trained PyTorch network given by model, the true_label (ground truth) and the input domain for the
         property, create a network encoding a 1 vs. all adversarial verification task.
@@ -401,15 +401,16 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
     layers.append(diff_layer)
     layers = simplify_network(layers)
 
-    cuda_verif_layers = [copy.deepcopy(lay).cuda() for lay in layers]
+    verif_layers = [copy.deepcopy(lay).cuda() for lay in layers] if gpu else layers
     if not use_ib:
         # use best of CROWN and KW as intermediate bounds
-        intermediate_net = Propagation(cuda_verif_layers, max_batch=max_solver_batch, type="best_prop",
+        intermediate_net = Propagation(verif_layers, max_batch=max_solver_batch, type="best_prop",
                                        params={"best_among": ["KW", "crown"]})
     else:
         # use IBP for intermediate bounds
-        intermediate_net = Propagation(cuda_verif_layers, max_batch=max_solver_batch, type="naive")
-    intermediate_net.define_linear_approximation(domain.cuda().unsqueeze(0), override_numerical_errors=True)
+        intermediate_net = Propagation(verif_layers, max_batch=max_solver_batch, type="naive")
+    verif_domain = domain.cuda().unsqueeze(0) if gpu else domain.unsqueeze(0)
+    intermediate_net.define_linear_approximation(verif_domain, override_numerical_errors=True)
     lbs = intermediate_net.lower_bounds[-1].squeeze(0).cpu()
 
     candi_tot = diff_out

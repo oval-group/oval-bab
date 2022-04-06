@@ -255,8 +255,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         for batch_idx in range(effective_batch_size):
             # Pick a domain to branch over and remove that from our current list of
             # domains. Also, potentially perform some pruning on the way.
-            # candidate_domain = bab.pick_out(domains, global_ub.cpu() - eps).to_device(intermediate_net_device)
-            candidate_domain = bab.pick_out(domains, global_ub.cpu() - eps).to_device(intermediate_net_device)
+            candidate_domain = bab.pick_out(domains, global_ub.cpu()).to_device(intermediate_net_device)
             # Populate the batch of subproblems for batched branching
             bab.set_subproblem_stacks_entry(batch_idx, domain_stack, lbs_stacks, ubs_stacks, candidate_domain.domain,
                                             candidate_domain.lower_all, candidate_domain.upper_all)

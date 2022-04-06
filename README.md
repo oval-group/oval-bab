@@ -72,15 +72,52 @@ Additionally, learning-based algorithms for branching and upper bounding (not in
   
 ## Running the code
 
+The repository provides two main functionalities: incomplete verification (bounding) and complete verification (branch and bound).
+We now detail how to run the OVAL framework in each of the two cases.
+
+### Complete verification
+
+**File `./tools/local_robustness_from_onnx.py` provides a script to verify that an `.onnx` network is robust to perturbations
+in `l_inf` norm to its input points (local robustness verification).**
+The comments in the file indicate which blocks should be modified to perform verification of different input-output 
+specifications (which will need to be represented in canonical form, see section 2.1 of [De Palma et al. (2021b)](https://arxiv.org/abs/2104.06718)), 
+and detail its input interface.
+
+Note that an `.onnx` input is not necessary: the user can alternatively specify a piecewise-linear network by directly 
+passing a list of layers to the `bab_from_json` function, as long as the network is in canonical form.
+
+The configuration/parameters of OVAL BaB are passed via a `.json` configuration file (see those in `./bab_configs/`).
+
+As an example, execute the following command:
+```
+python tools/local_robustness_from_onnx.py --network_filename ./models/onnx/cifar_base_kw.onnx
+```
+
+*Details on how to produce a .json configuration file (see `./bab_configs/`) for the OVAL framework will be soon added to the repository*
+
+### Incomplete verification
+
+All the bounding algorithms contained in the repository share a common interface (see "Incomplete Verifiers" above).
+**File `./tools/bounds_from_onnx.py` provides a guide to the interface and usage of the bounding (incomplete verification) algorithms.**   
+The guide supports bounding computations for a loaded `.onnx` network, or for small randomly sampled networks. 
+As for the complete verification use-case, the user can modify the code to pass a piecewise-linear network as a list of PyTorch layers.
+In addition, the file contains an example on how to directly run branch and bound without resorting to .json 
+configuration files. In this case, a small timeout is set to compute tighter bounds on the first output neuron of the loaded network.
+
+As an example, execute the following command:
+```
+python tools/bounds_from_onnx.py --network_filename ./models/onnx/cifar_base_kw.onnx
+```
+
+
+### VNN-COMP
 Scripts to run the code within the context of [VNNCOMP2021](https://github.com/stanleybak/vnncomp2021) are contained in `./vnncomp_scripts/`.
 Verification on a property expressed in the [vnnlib](http://www.vnnlib.org/) format 
 (ONNX network for the network + .vnnlib file for the property) --or on a list of properties in a .csv file-- 
 can be executed by running `./tools/bab_tools/bab_from_vnnlib.py` (check the code for details).
 
 In addition, code to run the framework on the OVAL and COLT datasets from VNNCOMP 2020 
-(see section 8.1 of [De Palma et al. (2021b)](https://arxiv.org/abs/2104.06718)) is contained in `./tools/bab_tools/bab_from_vnnlib.py`.
-
-*Further details, including how to produce a .json configuration file (see `./bab_configs/`) for the OVAL framework will be soon added to the repository*  
+(see section 8.1 of [De Palma et al. (2021b)](https://arxiv.org/abs/2104.06718)) is contained in `./tools/bab_tools/bab_runner.py`.
   
 ## Installation
 The code was implemented assuming to be run under `python3.6`.

@@ -19,7 +19,8 @@ def parse_input():
     parser.add_argument('--network_filename', type=str, help='onnx file to load.',
                         default="./models/onnx/cifar_base_kw.onnx")
     parser.add_argument('--gpu', action='store_true', help="run BaB on gpu rather than cpu -- will speed up execution")
-    parser.add_argument('--init_step', type=float, default=1e0, help="step size for optimization based algos")
+    parser.add_argument('--cifar_oval', action='store_true',
+                        help="test on the first CIFAR10 image, normalized for the networks in ./models/onnx/")
     parser.add_argument('--json', help='OVAL BaB json config file', default="./bab_configs/cifar2020_vnncomp21.json")
 
     args = parser.parse_args()
@@ -37,22 +38,37 @@ def parse_input():
     supported = vnnlib_utils.is_supported_model(model)
     assert supported
 
-    eps = 0.066
-    # Define input bounds as being a l_inf ball of eps around a randomly sampled point in [0, 1]. Specified as a stack
-    # of [lower bounds, upper bounds] along the last tensor dimension.
-    # NOTE: input domains different from l_inf balls (but still representable via element-wise lower and upper bounds)
-    # require the modification of this code block
-    input_point = torch.rand(in_shape)
-    input_bounds = torch.stack([(input_point - eps).clamp(0, 1), (input_point + eps).clamp(0, 1)], dim=-1)
+    if not args.cifar_oval:
+        eps = 0.065
+        # Define input bounds as being a l_inf ball of eps around a randomly sampled point in [0, 1]. Specified as a
+        # stack of [lower bounds, upper bounds] along the last tensor dimension.
+        # NOTE: input domains different from l_inf balls (but still representable via element-wise lower/upper bounds)
+        # require the modification of this code block
+        input_point = torch.rand(in_shape)
+        input_bounds = torch.stack([(input_point - eps).clamp(0, 1), (input_point + eps).clamp(0, 1)], dim=-1)
+        y = 2
+    else:
+        # Performs verification on the first CIFAR10 image, assuming the network expects the same input normalization
+        # as the networks in ./models/onnx/
+        import torchvision.transforms as transforms
+        import torchvision.datasets as datasets
+        idx = 0
+
+        # NOTE: the input normalization and format must match the one employed at training time
+        normalizer = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.225, 0.225, 0.225])
+        test_data = datasets.CIFAR10('./cifardata/', train=False, download=True, transform=transforms.ToTensor())
+        input_point, y = test_data[idx]
+        eps = 2 / 255
+        input_bounds = torch.stack([normalizer((input_point - eps).clamp(0, 1)),
+                                    normalizer((input_point + eps).clamp(0, 1))], dim=-1)
 
     # ReLUify any maxpool...
     with torch.no_grad():
         layers = vnnlib_utils.remove_maxpools(copy.deepcopy(list(model.children())), input_bounds, dtype=dtype)
 
-    # Define 1vsall local robustness property in canonical form, assuming the correct class is at index 2
+    # Define 1vsall local robustness property in canonical form, assuming the correct class is at index y
     # NOTE: in case of different output specifications, this code block should be replaced by their representation as
     # a series of Linear/Conv2d layers and ReLU activations
-    y = 2
     verif_layers = one_vs_all_from_model(
         torch.nn.Sequential(*layers), y, domain=input_bounds, max_solver_batch=1000, use_ib=True, gpu=args.gpu)
 

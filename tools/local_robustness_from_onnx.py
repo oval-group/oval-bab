@@ -9,6 +9,10 @@ import torch, copy, json
 
 """
     Example on how to run OVAL BaB for a 1 vs. all local robustness property using .json configuration files.
+    
+    Supported network structure:
+    pre-layer transforms" (this includes additions, multiplications --this covers normalization--, reshapings, flattenings, etc) -> 
+    linear (nn.Linear or nn.Conv2d) -> ReLU() -> "pre-layer transforms" -> linear -> ReLU() -> "pre-layer transforms" -> linear
 """
 
 def parse_input():
@@ -32,7 +36,8 @@ def parse_input():
     model, in_shape, out_shape, dtype, model_correctness = vnnlib_utils.onnx_to_pytorch(args.network_filename)
 
     if not model_correctness:
-        return None, False
+        raise ValueError(
+            "The parsed network does not match the onnx runtime output: please edit tools/bab_tools/onnx_reader.py")
 
     # Assert that the model specification is currently supported.
     supported = vnnlib_utils.is_supported_model(model)

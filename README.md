@@ -118,6 +118,13 @@ can be executed by running `./tools/bab_tools/bab_from_vnnlib.py` (check the cod
 
 In addition, code to run the framework on the OVAL and COLT datasets from VNNCOMP 2020 
 (see section 8.1 of [De Palma et al. (2021b)](https://arxiv.org/abs/2104.06718)) is contained in `./tools/bab_tools/bab_runner.py`.
+
+### Supported network structures
+
+The network to be verified/bounded (either via `.onnx` parsing or directly from a list of `torch` layers) must have the following form:
+
+    pre-layer transforms" (this includes additions, multiplications --this covers normalization--, reshapings, flattenings, etc) -> 
+    linear (nn.Linear or nn.Conv2d) -> ReLU() -> "pre-layer transforms" -> linear -> ReLU() -> "pre-layer transforms" -> linear
   
 ## Installation
 The code was implemented assuming to be run under `python3.6`.

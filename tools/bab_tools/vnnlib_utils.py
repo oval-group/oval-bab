@@ -52,6 +52,10 @@ def onnx_to_pytorch(onnx_path):
         torch_layers.pop(idx)
     torch_model = nn.Sequential(*torch_layers)
 
+    if not (isinstance(torch_layers[-1], nn.Linear) or isinstance(torch_layers[-1], nn.Conv2d)):
+        raise ValueError("OVAL-BaB expects the network to end with a linear layer. "
+                         "Please add a dummy identity output layer if needed.")
+
     # Execute a random image on both the onnx and the converted pytorch model and check whether they're reasonably close
     image = torch.rand(onnx_input_shape, dtype=dtype)
     onnx_in = image.numpy()

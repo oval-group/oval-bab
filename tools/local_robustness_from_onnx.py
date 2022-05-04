@@ -12,7 +12,7 @@ import torch, copy, json
     
     Supported network structure (pre-layer transforms are optional):
     "pre-layer transforms" (this includes additions, multiplications --this covers normalization--, reshapings, flattenings, etc) -> 
-    linear (nn.Linear or nn.Conv2d) -> ReLU() -> "pre-layer transforms" -> linear -> ReLU() -> "pre-layer transforms" -> linear
+    linear (nn.Linear or nn.Conv2d) -> ReLU() -> "pre-layer transforms" -> linear -> ReLU() -> "pre-layer transforms" -> [linear]
 """
 
 def parse_input():

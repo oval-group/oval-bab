@@ -4,7 +4,7 @@ import torch.nn as nn
 from copy import deepcopy
 import numpy as np
 import re, os
-from tools.custom_torch_modules import supported_transforms
+from tools.custom_torch_modules import supported_transforms, Flatten
 from plnn.model import simplify_network, remove_maxpools
 from plnn.proxlp_solver.propagation import Propagation
 from tools.bab_tools.model_utils import reluified_max_pool
@@ -24,7 +24,14 @@ def predict_with_onnxruntime(model_def, *inputs):
     return {name: output for name, output in zip(names, res)}
 
 
-def onnx_to_pytorch(onnx_path):
+def create_identity_layer(n, dtype=torch.float32):
+    id_layer = nn.Linear(n, n, bias=True)
+    id_layer.weight = nn.Parameter(torch.eye(n, dtype=dtype), requires_grad=False)
+    id_layer.bias = nn.Parameter(torch.zeros((n,), dtype=dtype), requires_grad=False)
+    return id_layer
+
+
+def onnx_to_pytorch(onnx_path, numerical_tolerance=1e-3):
     if onnx_path.endswith(".gz"):
         os.system(f"gzip -dfk {onnx_path}")
         onnx_path = onnx_path.replace(".gz", "")
@@ -50,11 +57,14 @@ def onnx_to_pytorch(onnx_path):
                 to_remove.append(idx)
     for idx in to_remove:
         torch_layers.pop(idx)
-    torch_model = nn.Sequential(*torch_layers)
 
     if not (isinstance(torch_layers[-1], nn.Linear) or isinstance(torch_layers[-1], nn.Conv2d)):
-        raise ValueError("OVAL-BaB expects the network to end with a linear layer. "
-                         "Please add a dummy identity output layer if needed.")
+        # OVAL-BaB expects the network to end with a linear layer: adding it.
+        linear_layers = list(filter(lambda x: isinstance(x, nn.Linear) or isinstance(x, nn.Conv2d), torch_layers))
+        if isinstance(linear_layers[-1], nn.Conv2d):
+            torch_layers.append(Flatten())
+        torch_layers.append(create_identity_layer(np.prod(onnx_output_shape[1:])))
+    torch_model = nn.Sequential(*torch_layers)
 
     # Execute a random image on both the onnx and the converted pytorch model and check whether they're reasonably close
     image = torch.rand(onnx_input_shape, dtype=dtype)
@@ -62,7 +72,7 @@ def onnx_to_pytorch(onnx_path):
     onnx_out = predict_with_onnxruntime(onnx_model, onnx_in)
     onnx_out = torch.tensor(onnx_out[list(onnx_out.keys())[0]])
     torch_out = torch_model(image)
-    correctness = ((onnx_out - torch_out).abs().max() < 1e-4)
+    correctness = ((onnx_out - torch_out).abs().max() < numerical_tolerance)
 
     return torch_model, onnx_input_shape[1:] if onnx_input_shape[1:] else onnx_input_shape, onnx_output_shape[1:], \
            dtype, correctness
@@ -77,15 +87,9 @@ def add_canonical_layers_from_outspecs(domain, out_specs, model, max_solver_batc
     """
     model_layers = list(model)
 
-    def create_identity_layer(n):
-        id_layer = nn.Linear(n, n, bias=True)
-        id_layer.weight = nn.Parameter(torch.eye(n, dtype=dtype), requires_grad=False)
-        id_layer.bias = nn.Parameter(torch.zeros((n,), dtype=dtype), requires_grad=False)
-        return id_layer
-
     # Add identity linear layer at the end if the last layer is an activation.
     if type(model[-1]) not in [nn.Linear, nn.Conv2d]:
-        model_layers += [create_identity_layer(model[-2].out_features)]
+        model_layers += [create_identity_layer(model[-2].out_features, dtype=dtype)]
 
     def get_lbs_from_layers(clayers):
         # use tighter bounds than IBP to reduce numerical imprecisions
@@ -144,7 +148,7 @@ def add_canonical_layers_from_outspecs(domain, out_specs, model, max_solver_batc
         for idx in range(and_size):
             while len(and_layers[idx]) < max_or_depth:
                 n_id = and_layers[idx][0].out_features
-                identity_layer = create_identity_layer(n_id)
+                identity_layer = create_identity_layer(n_id, dtype=dtype)
                 and_layers[idx] = and_layers[idx][:2] + [identity_layer, nn.ReLU()] + and_layers[idx][2:]
 
         # Aggregate the subnetworks.

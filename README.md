@@ -125,7 +125,7 @@ The network to be verified/bounded (either via `.onnx` parsing or directly from 
 where optional layers are enclosed in brackets:
 
     ["pre-layer transforms"] (this includes additions, multiplications --this covers normalization--, reshapings, flattenings, etc) -> 
-    linear (nn.Linear or nn.Conv2d) -> ReLU() -> ["pre-layer transforms"] -> linear -> ReLU() -> ["pre-layer transforms"] -> linear
+    linear (nn.Linear or nn.Conv2d) -> ReLU() -> ["pre-layer transforms"] -> linear -> ReLU() -> ["pre-layer transforms"] -> [linear]
   
 ## Installation
 The code was implemented assuming to be run under `python3.6`.

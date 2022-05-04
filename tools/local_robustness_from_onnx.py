@@ -10,8 +10,8 @@ import torch, copy, json
 """
     Example on how to run OVAL BaB for a 1 vs. all local robustness property using .json configuration files.
     
-    Supported network structure:
-    pre-layer transforms" (this includes additions, multiplications --this covers normalization--, reshapings, flattenings, etc) -> 
+    Supported network structure (pre-layer transforms are optional):
+    "pre-layer transforms" (this includes additions, multiplications --this covers normalization--, reshapings, flattenings, etc) -> 
     linear (nn.Linear or nn.Conv2d) -> ReLU() -> "pre-layer transforms" -> linear -> ReLU() -> "pre-layer transforms" -> linear
 """
 

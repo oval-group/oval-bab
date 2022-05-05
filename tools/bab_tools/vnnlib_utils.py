@@ -41,6 +41,13 @@ def onnx_to_pytorch(onnx_path, numerical_tolerance=1e-3):
     except ResNetError as resneterror:
         print(resneterror)
         return None, None, None, None, False
+    except KeyError:
+        import onnxsim
+        print("Operations on constants are not supported by the onnx converter, "
+              "simplifying the model using the external onnxsim library (please install it if missing).")
+        model_simp, check = onnxsim.simplify(onnx_model)
+        assert check, "the onnx simplification library failed"
+        torch_layers = [param for param in OnnxConverter(model_simp).children()]
 
     onnx_input_shape = [cdim.dim_value if cdim.dim_value > 0 else 1 for cdim in
                         onnx_model.graph.input[0].type.tensor_type.shape.dim]

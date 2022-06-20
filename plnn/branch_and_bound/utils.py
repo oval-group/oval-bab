@@ -5,6 +5,7 @@ import copy
 import traceback
 import os
 from math import ceil
+from plnn.proxlp_solver.utils import override_numerical_bound_errors
 
 
 def add_domain(candidate, domains):
@@ -200,7 +201,7 @@ def get_domains_from_file(domains, dumped_domain_filelblist, block_size):
     if len(domains) <= block_size and len(dumped_domain_filelblist) != 0:
         filename = dumped_domain_filelblist[-1][0]
         # Load a block of domains.
-        loaded_doms = torch.load(filename)
+        loaded_doms = torch.load(filename, map_location='cpu')
         os.remove(filename)
         # Insert them in domain list.
         for cdom in loaded_doms:

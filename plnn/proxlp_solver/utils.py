@@ -79,6 +79,12 @@ def apply_transforms(transforms, inp, inverse=False, no_fold=False):
     return inp
 
 
+def override_numerical_bound_errors(lbs, ubs, numerical_tolerance=1e-5):
+    ubs = torch.where(
+        (ubs - lbs <= 0) & (ubs - lbs >= -numerical_tolerance), lbs + numerical_tolerance, ubs)
+    return lbs, ubs
+
+
 class LinearOp:
     def __init__(self, weights, bias, pre_transform=None):
         self.weights = weights

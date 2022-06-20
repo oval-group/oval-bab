@@ -54,7 +54,7 @@ class ReLUDomain:
         if self.parent_ub_point is not None:
             self.parent_ub_point = self.parent_ub_point.cpu()
         if self.domain is not None:
-            self.domain.cpu()
+            self.domain = self.domain.cpu()
         return self
 
     def to_device(self, device):
@@ -68,7 +68,7 @@ class ReLUDomain:
         if self.parent_ub_point is not None:
             self.parent_ub_point = self.parent_ub_point.to(device)
         if self.domain is not None:
-            self.domain.to(device)
+            self.domain = self.domain.to(device)
         return self
 
 
@@ -149,16 +149,19 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         return intermediate_lbs[-1], intermediate_ubs[-1], \
                torch.zeros_like(intermediate_net.lower_bounds[0]), nb_visited_states
 
-    if intermediate_dict["tight_ib"] is not None and intermediate_dict["tight_ib"]["net"] is not None:
-        # Compute tighter intermediate bounds for fully connected layers.
-        before_last = len(intermediate_lbs) - 2
-        intermediate_dict["tight_ib"]["net"].build_model_using_bounds(
-            domain.unsqueeze(0), (intermediate_lbs, intermediate_ubs), build_limit=before_last)
-        updated_lbs, updated_ubs = intermediate_dict["tight_ib"]["net"].compute_lower_bound(
-            node=(before_last, None), counterexample_verification=True)
-        # retain best bounds
-        intermediate_lbs[before_last] = torch.max(updated_lbs, intermediate_lbs[before_last])
-        intermediate_ubs[before_last] = torch.min(updated_ubs, intermediate_ubs[before_last])
+    if "tight_ib" in intermediate_dict and intermediate_dict["tight_ib"] is not None and \
+            intermediate_dict["tight_ib"]["net"] is not None:
+        # Compute tighter intermediate bounds for ambiguous neurons.
+        dummy_branching_log = {idx: [0] for idx in range(-1, len(intermediate_lbs) - 1)}
+        neurons_to_opt = {}
+        loose_layer_range = list(range(2, len(intermediate_lbs) - 1))
+        for lay_idx in loose_layer_range:
+            ambiguous = ((intermediate_lbs[lay_idx] < 0) & (intermediate_ubs[lay_idx] > 0)).view(1, -1)
+            max_ambiguous = ambiguous.sum(1).max().item()  # Max. no. of ambiguous activations across batches
+            neurons_to_opt[lay_idx] = torch.topk(ambiguous.type(intermediate_lbs[0].dtype), max_ambiguous)[1]
+        intermediate_bounds_subroutine(
+            intermediate_dict["tight_ib"]["net"], domain.unsqueeze(0), intermediate_lbs,
+            intermediate_ubs, loose_layer_range, dummy_branching_log, neurons_to_opt=neurons_to_opt)
 
     print('computing last layer bounds')
     # compute last layer bounds with a more expensive network
@@ -326,7 +329,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         # Compute branching choices
         # TODO: branching will return IndexError in case no ambiguous ReLU is left. Should catch and get the LP solution
         branch_start = time.time()
-        branching_decision_list = brancher.branch(domain_stack, lbs_stacks, ubs_stacks)
+        branching_decision_list = brancher.branch(
+            domain_stack, lbs_stacks, ubs_stacks, parent_net=bounds_net, parent_init=parent_init_stacks)
         branch_time = time.time() - branch_start
         print(f"Branching requires {branch_time}[s]")
 
@@ -371,7 +375,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
             global_ub_point = batch_ub_point
 
         # sequentially add all the domains to the queue (ordered list)
-        batch_global_lb = dom_lb[0]
+        batch_global_lb = torch.min(dom_lb, dim=0)[0]
         added_domains = 0
         for batch_idx in range(dom_lb.shape[0]):
             # print('dom_lb: ', dom_lb[batch_idx])
@@ -411,8 +415,6 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                         bab.add_domain(dom_to_add, harder_domains)
                     else:
                         bab.add_domain(dom_to_add, domains)
-
-                batch_global_lb = min(dom_lb[batch_idx], batch_global_lb)
 
         expans_factor = max(float(added_domains) / (dom_lb.shape[0]/2), 1.0)
         print(f"Batch expansion factor: {expans_factor}")
@@ -481,9 +483,14 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         # If early_terminate is True, we return early if we predict that the property won't be verified within the time
         # (if the estimated time to cross the decision threshold + to deplete the bounds goes over the timeout)
         t_to_timeout = timeout - (time.time() - start_time)
-        if early_terminate and n_iter > 5 and \
-                ((decision_bound - global_lb) / expected_improvement + len(domains) / batch_size >
-                 t_to_timeout / bound_time):
+        early_terminate_lhs = (decision_bound - global_lb) / expected_improvement + len(domains) / batch_size
+        # consider pickled domains
+        early_terminate_lhs += len(dumped_domain_filelblist) * dumped_domain_blocksize / batch_size
+        if next_net_info is not None:
+            # add time to deplete harder domains as well
+            early_terminate_lhs += len(harder_domains) * next_net_info["hard_overhead"] / next_net_info[
+                "batch_size"]
+        if early_terminate and n_iter > 5 and (early_terminate_lhs > t_to_timeout / bound_time):
             print(
                 f'early timeout with expected improvement: {expected_improvement} with {t_to_timeout} [s] remaining.')
             bab.join_children(gurobi_dict, timeout)
@@ -491,25 +498,9 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
             return None, None, None, nb_visited_states
 
         # run attacks
-        # Try falsification only in the first 50 batch iterations. TODO: better UB heuristic?
+        # Try falsification only in the first 50 batch iterations.
         if ub_method is not None and global_ub > decision_bound and n_iter < 50:
-            # Use the 10 best points from the LB initialization amongst the falsification initializers
-            val, ind = torch.topk(dom_ub, dim=0, k=min(10, dom_ub.size()[0]))
-            init_tensor = dom_ub_point[ind.squeeze()]
-
-            # perform attacks for property falsification
-            adv_examples, is_adv, scores = ub_method.create_adv_examples(
-                return_criterion='one', gpu=True, multi_targets=True, init_tensor=init_tensor)
-
-            # Update upper bound and its associated point.
-            attack_ub, attack_point_idx = torch.min(scores, dim=0)
-            attack_point = adv_examples[attack_point_idx]
-            if attack_ub < global_ub:
-                global_ub = attack_ub
-                global_ub_point = attack_point
-
-            if is_adv.sum() > 0:
-                 print("Found a counter-example.")
+            global_ub, global_ub_point = run_attack(ub_method, dom_ub, dom_ub_point, global_ub, global_ub_point)
 
         print(f"Current: lb:{global_lb}\t ub: {global_ub}")
         # Stopping criterion
@@ -691,11 +682,14 @@ def intermediate_bounds_subroutine(bounding_net, splitted_domain, intermediate_l
             (sub_batch_intermediate_lbs, sub_batch_intermediate_ubs), build_limit=x_idx)
         updated_lbs, updated_ubs = bounding_net.compute_lower_bound(
             node=(x_idx, None if neurons_to_opt is None else neurons_to_opt[x_idx][active_batch_ids]),
-            counterexample_verification=True)
+            counterexample_verification=True, override_numerical_errors=True)
 
         # retain best bounds and update intermediate bounds from batch
         intermediate_lbs[x_idx][active_batch_ids] = torch.max(updated_lbs, intermediate_lbs[x_idx][active_batch_ids])
         intermediate_ubs[x_idx][active_batch_ids] = torch.min(updated_ubs, intermediate_ubs[x_idx][active_batch_ids])
+        intermediate_lbs[x_idx][active_batch_ids], intermediate_ubs[x_idx][active_batch_ids] = \
+            bab.override_numerical_bound_errors(intermediate_lbs[x_idx][active_batch_ids],
+                                                intermediate_ubs[x_idx][active_batch_ids])
         bounding_net.unbuild()
 
 
@@ -757,3 +751,24 @@ def compute_last_bounds_cpu(bounds_net, splitted_domain, splitted_lbs, splitted_
             dual_solutions.set_stack_parent_entries(c_dual_solutions, slice_indices)
 
     return splitted_lbs, splitted_ubs, dom_ub_point, dual_solutions
+
+
+def run_attack(ub_method, dom_ub, dom_ub_point, global_ub, global_ub_point):
+    # Use the 10 best points from the LB initialization amongst the falsification initializers
+    val, ind = torch.topk(dom_ub, dim=0, k=min(10, dom_ub.size()[0]))
+    init_tensor = dom_ub_point[ind.squeeze()]
+
+    # perform attacks for property falsification
+    adv_examples, is_adv, scores = ub_method.create_adv_examples(
+        return_criterion='one', gpu=True, multi_targets=True, init_tensor=init_tensor)
+
+    # Update upper bound and its associated point.
+    attack_ub, attack_point_idx = torch.min(scores, dim=0)
+    attack_point = adv_examples[attack_point_idx]
+    if is_adv.sum() > 0:
+        print("Found a counter-example.")
+
+    if attack_ub < global_ub:
+        global_ub = attack_ub
+        global_ub_point = attack_point
+    return global_ub, global_ub_point

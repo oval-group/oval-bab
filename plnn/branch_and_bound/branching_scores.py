@@ -1,5 +1,5 @@
 import torch
-from plnn.proxlp_solver.propagation import Propagation
+from plnn.proxlp_solver.propagation import Propagation, PropInit
 import math
 
 
@@ -20,7 +20,7 @@ class BranchingChoice:
                 self.__dict__[key] = branch_dict[key]["net"]
             else:
                 self.__dict__[key] = branch_dict[key]
-        if self.heuristic_type not in ["SR", "FSB", "input"]:
+        if self.heuristic_type not in ["SR", "FSB", "input", "UPB"]:
             raise NotImplementedError(f"Branching heuristic {self.heuristic_type} not implemented.")
 
         # Set other parameters.
@@ -28,23 +28,26 @@ class BranchingChoice:
         self.sparsest_layer = sparsest_layer
 
         # Set SR-specific parameters and variables.
-        if self.heuristic_type in ["SR", "FSB"]:
+        if self.heuristic_type in ["SR", "FSB", "UPB"]:
             self.icp_score_counter = 0
             # if the maximum score is below the threshold, we consider it to be non-informative
             self.decision_threshold = 0.001
+            self.upb_fallback_thr = 1e-4
 
         # Set the branching function.
-        branching_function_dict = {"SR": self.branch_sr, "FSB": self.branch_fsb, "input": self.branch_input_bab}
+        branching_function_dict = {"SR": self.branch_sr, "FSB": self.branch_fsb,
+                                   "UPB": self.branch_upb, "input": self.branch_input_bab}
         self.branching_function = branching_function_dict[self.heuristic_type]
 
         # Set the splitting function.
-        splitting_function_dict = {"SR": self.relu_split, "FSB": self.relu_split, "input": self.input_split}
+        splitting_function_dict = {"SR": self.relu_split, "FSB": self.relu_split,
+                                   "UPB": self.relu_split, "input": self.input_split}
         self.splitting_function = splitting_function_dict[self.heuristic_type]
 
-    def branch(self, domains, lower_bounds, upper_bounds):
-        # Given batches of domains, lower and upper bounds, compute and return a list of branching decision for
-        # each of them.
-        return self.branching_function(domains, lower_bounds, upper_bounds)
+    def branch(self, domains, lower_bounds, upper_bounds, **kwargs):
+        # Given batches of domains, lower and upper bounds, and possibly additional information about the BaB nodes
+        # to split (kwargs), compute and return a list of branching decision for each of them.
+        return self.branching_function(domains, lower_bounds, upper_bounds, **kwargs)
 
     def babsr_scores(self, domains, lower_bounds, upper_bounds, minsplit=True):
         '''
@@ -90,7 +93,7 @@ class BranchingChoice:
 
         return score_s, score_t, mask, nonambscores, prop_net.weights
 
-    def branch_sr(self, domains, lower_bounds, upper_bounds):
+    def branch_sr(self, domains, lower_bounds, upper_bounds, **kwargs):
         '''
         choose the dimension to split on
         based on each node's contribution to the cost function in the KW formulation.
@@ -163,13 +166,11 @@ class BranchingChoice:
 
         return decision_list
 
-    def branch_fsb(self, domains, lower_bounds, upper_bounds):
+    def branch_fsb(self, domains, lower_bounds, upper_bounds, **kwargs):
         """
         Choose which neuron to split on by evaluating the contribution to the final layer bounding of fixing
         the most promising neurons according to the KW heuristic.
-        :param max_domains: if not None, indicates how many domains to compute at once with bounding_net
         """
-
         kw_score, intercept_score, _, _, _ = self.babsr_scores(domains, lower_bounds, upper_bounds, minsplit=True)
         primal_score = kw_score
         secondary_score = [-cintercept for cintercept in intercept_score]
@@ -298,6 +299,60 @@ class BranchingChoice:
 
         return branching_decision_list, impr
 
+    def branch_upb(self, domains, lower_bounds, upper_bounds, **kwargs):
+        '''
+        Split according to the contribution of the Upper Planet Bias (UPB) on the beta-CROWN (or alpha-CROWN) objective.
+        NOTE: if the current output bounding algorithm is not alpha/beta-CROWN, the strategy will revert to FSB.
+        '''
+        parent_net = kwargs["parent_net"]
+        parent_init = kwargs["parent_init"]
+
+        # Use current output bounding network to retrieve dual variables
+        assert parent_net is not None and parent_init is not None, \
+            "parent_net and parent_init params are required for UPB"
+
+        if not (isinstance(parent_net, Propagation) and "-crown" in parent_net.type and
+                isinstance(parent_init, PropInit)):
+            # parent_net must be using alpha/beta-CROWN to use UPB: this is the only dual for which it's designed
+            return self.branch_fsb(domains, lower_bounds, upper_bounds)
+
+        # Pass dual initialization to parent_net to retrieve the dual vars for the parent nodes
+        parent_net.initialize_from(parent_init.get_presplit_parents())
+        # Compute lambda and mu dual variables (the initialization only contains alpha/beta)
+        parent_net.build_model_using_bounds(domains, (lower_bounds, upper_bounds))
+        crown_vars = parent_net.get_closedform_lastlayer_lb_duals()
+
+        # Compute the intercept scores from BaBSR/FSB, yet on the parent solution of the alpha-beta CROWN dual
+        # The following computations rely on the unconditioned bias for the first layer (see SR scores)
+        scores = []
+        batch_size = lower_bounds[0].shape[0]
+        for lay, (clbs, cubs) in enumerate(zip(lower_bounds, upper_bounds)):
+            if lay > 0 and lay < len(lower_bounds) - 1:
+                cmask = ((cubs > 0) & (clbs < 0)).unsqueeze(1)
+                bias = - ((clbs * cubs) / (cubs - clbs)).unsqueeze(1).masked_fill_(~cmask, 0)
+                beta_acs_score = bias * crown_vars.lambdas[lay - 1].clamp(0, None)
+                scores.append(beta_acs_score.reshape((batch_size, -1)))
+
+        # Select the neurons associated to the best scores for each batch entry.
+        max_info = [torch.max(cscore, dim=-1) for cscore in scores]
+        max_indices = torch.stack([cmaxinfo[1] for cmaxinfo in max_info], dim=0)
+        max_value = torch.stack([cmaxinfo[0] for cmaxinfo in max_info], dim=0)
+        max_score, layer_ind = torch.max(max_value, dim=0)
+        neuron_indices = max_indices.gather(0, layer_ind.unsqueeze(0)).squeeze(0).tolist()
+        decision_list = list(zip(layer_ind.tolist(), neuron_indices))
+
+        # Use FSB as fallback strategy when scores are low or a split would be performed on the first layer.
+        condition = (max_score <= self.upb_fallback_thr)
+        if condition.any():
+            fsb_decisions = self.branch_fsb(domains, lower_bounds, upper_bounds)
+            to_switch = condition.nonzero()
+            for batch_idx in to_switch:
+                decision_list[batch_idx] = fsb_decisions[batch_idx]
+            print(f"Using fallback branching for {len(to_switch)} decisions")
+
+        parent_net.unbuild()
+        return decision_list
+
     def split_subdomain(self, decision, choice, batch_idx, domains, lbs_stacks, ubs_stacks):
         """
         Given a branching decision and stacks of bounds for all the activations, duplicated so that the i-th
@@ -334,7 +389,7 @@ class BranchingChoice:
                 # passing ReLU obtained by setting the pre-activation LB to 0
                 splitted_lbs_stacks[change_idx][batch_idx].view(-1)[decision[1]] = split_point
 
-    def branch_input_bab(self, domains, lower_bounds, upper_bounds):
+    def branch_input_bab(self, domains, lower_bounds, upper_bounds, **kwargs):
         # do input splitting along max dimension
         split_indices = torch.argmax((domains.select(-1, 1) - domains.select(-1, 0)).view(lower_bounds[0].shape[0], -1),
                                      dim=-1)

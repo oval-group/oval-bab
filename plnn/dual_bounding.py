@@ -5,10 +5,9 @@ import torch
 
 from plnn.network_linear_approximation import LinearizedNetwork
 from plnn.proxlp_solver.utils import BatchLinearOp, BatchConvOp, get_relu_mask, compute_output_padding, \
-    create_final_coeffs_slice, LinearOp, ConvOp, prod, apply_transforms, CompositeLinearOp
+    create_final_coeffs_slice, LinearOp, ConvOp, prod, apply_transforms, CompositeLinearOp, \
+    override_numerical_bound_errors
 from tools.custom_torch_modules import supported_transforms, shape_transforms, math_transforms
-
-numerical_tolerance = 1e-5
 
 
 class DualBounding(LinearizedNetwork):
@@ -113,7 +112,8 @@ class DualBounding(LinearizedNetwork):
         obj_layer = CompositeLinearOp(operators, in_example, pre_transform=pre_transform)
         return obj_layer, to_skip_count
 
-    def compute_lower_bound(self, node=(-1, None), upper_bound=False, counterexample_verification=False):
+    def compute_lower_bound(self, node=(-1, None), upper_bound=False, counterexample_verification=False,
+                            override_numerical_errors=False):
         '''
         Compute a lower bound of the function for the given node
 
@@ -195,6 +195,8 @@ class DualBounding(LinearizedNetwork):
                     lbs = torch.where(lbs > ubs, float('inf') * torch.ones_like(lbs), lbs)
                     ubs = torch.where(lbs > ubs, float('inf') * torch.ones_like(ubs), ubs)
                 # otherwise, ignore the problem: it will be caught by the last layer
+                if override_numerical_errors:
+                    lbs, ubs = override_numerical_bound_errors(lbs, ubs)
                 return lbs, ubs
 
             assert (ubs - lbs).min() >= 0, "Incompatible bounds"
@@ -212,6 +214,8 @@ class DualBounding(LinearizedNetwork):
             current_lbs.scatter_(1, node[1], opted_lbs)
             current_ubs = current_ubs.view(batch_size, *node_layer_shape)
             current_lbs = current_lbs.view(batch_size, *node_layer_shape)
+            if override_numerical_errors:
+                current_lbs, current_ubs = override_numerical_bound_errors(current_lbs, current_ubs)
             return current_lbs, current_ubs
         else:
             # Return lb or ub (depending on upper_bound=False or True) for the selected neuron.
@@ -251,8 +255,7 @@ class DualBounding(LinearizedNetwork):
                 l_1, u_1, cond_first_linear = self.build_first_conditioned_layer(l_0, u_0, layer, no_conv)
 
                 if override_numerical_errors:
-                    u_1 = torch.where((u_1 - l_1 <= 0) & (u_1 - l_1 >= -numerical_tolerance),
-                                      l_1 + numerical_tolerance, u_1)
+                    l_1, u_1 = override_numerical_bound_errors(l_1, u_1)
                 assert (u_1 - l_1).min() >= 0, "Incompatible bounds"
 
                 if no_conv:
@@ -449,8 +452,7 @@ class DualBounding(LinearizedNetwork):
         ubs = ubs.view(batch_size, *out_shape)
 
         if override_numerical_errors:
-            ubs = torch.where(
-                (ubs - lbs <= 0) & (ubs - lbs >= -numerical_tolerance), lbs + numerical_tolerance, ubs)
+            lbs, ubs = override_numerical_bound_errors(lbs, ubs)
         assert (ubs - lbs).min() >= 0, "Incompatible bounds"
 
         return lbs, ubs

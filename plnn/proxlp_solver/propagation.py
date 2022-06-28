@@ -291,7 +291,6 @@ class Propagation(DualBounding):
     def get_closedform_lastlayer_lb_duals(self):
         # Returns dual variables (instance of dj_relaxation.DualVarSet) corresponding to closed-form bounding
         # computations for the lower bounds of the network output. Assumes the network has only one output.
-
         weights = self.weights
         lower_bounds = self.lower_bounds
         upper_bounds = self.upper_bounds
@@ -302,6 +301,13 @@ class Propagation(DualBounding):
             # Compute dual variables.
             dual_vars = PropDualVars.get_duals_from(
                 weights, additional_coeffs, lower_bounds, upper_bounds, init_type=self.type)
+        elif "-crown" in self.type:
+            # Compute dual variables using external init.
+            assert self.external_init is not None
+            alphas, gammas, betas = self.external_init.alphas, self.external_init.gammas, self.external_init.betas
+            dual_vars = PropDualVars.get_duals_from(
+                weights, additional_coeffs, lower_bounds, upper_bounds, init_type=self.type,
+                alphas=alphas, gammas=gammas, betas=betas)
         else:
             raise ValueError("get_closedform_duals callable only for crown or KW bounds.")
         return dual_vars
@@ -545,4 +551,14 @@ class PropInit(ParentInit):
                       "u": self.lb_only_list(self.gammas["u"])}
         if self.betas is not None:
             betas = self.lb_only_list(self.betas)
+        return PropInit(alphas, parent_gammas=gammas, parent_betas=betas)
+
+    def get_presplit_parents(self):
+        # Before bounding, the parent init class contains two copies of each initializer (one per BaB children).
+        # Return only one of them.
+        def halve(xlist):
+            return [x.view((x.shape[0]//2, 2, *x.shape[1:])).select(1, 0) for x in xlist]
+        alphas = halve(self.alphas)
+        gammas = {"l": halve(self.gammas["l"]), "u": halve(self.gammas["u"])} if self.gammas is not None else None
+        betas = halve(self.betas) if self.betas is not None else None
         return PropInit(alphas, parent_gammas=gammas, parent_betas=betas)

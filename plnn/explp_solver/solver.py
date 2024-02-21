@@ -309,6 +309,7 @@ class ExpLP(SaddleLP):
             'nb_outer_iter': 10,
             'bigm': 'init',
             'restrict_factor': -1,  # If != -1, the fraction of the convolutional channels to use
+            'delete_d': False,
         }
         if self.cut_only:
             opt_args.update(self.params)
@@ -484,7 +485,8 @@ class ExpLP(SaddleLP):
             # do adam for subgradient ascent
             dual_vars_subg_updated = adam_stats.active_set_adam_step(
                 weights, masked_ops, step_size, steps, dual_vars, primal_vars, clbs, cubs, nubs, lower_bounds,
-                upper_bounds, l_checks, u_checks, opt_args, precision=self.precision)
+                upper_bounds, l_checks, u_checks, opt_args, precision=self.precision,
+                delete_d=opt_args["delete_d"])
             dual_vars.update_from_step(weights, dual_vars_subg_updated)
 
             if self.debug:
@@ -575,6 +577,8 @@ class ExpLP(SaddleLP):
                                                                         lower_bounds[0].shape[1:])
             if opt_args["larger_irl_if_naive_init"]:
                 init_step_size = opt_args['initial_step_size'] * 10
+            else:
+                init_step_size = opt_args['initial_step_size']
 
         # Adam-related quantities.
         adam_stats = bigm_optimization.DualADAMStats(dual_vars.beta_0, beta1=opt_args['betas'][0], beta2=opt_args['betas'][1])

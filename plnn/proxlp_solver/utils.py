@@ -737,16 +737,18 @@ class CompositeLinearOp:
 
         # Perform a full forward pass to infer the necessary shapes.
         cinp = self.inp_example
+        cbias = torch.zeros_like(cinp)
         for idx, cop in enumerate(operators):
             folded_inp, batch_shape = self.fold_batches(cinp)
             cout = cop(folded_inp)
+            folded_bias, _ = self.fold_batches(cbias)
+            cbias = cop(folded_bias)
             self.out_examples.append(cout.reshape(*batch_shape, *cout.shape[1:]))
             cinp = cout
 
         self.pre_transform = pre_transform  # Transform to apply on the input space (after prescaling)
-        self.out_shape = (1, 1, *cinp.shape[2:])
-        self.bias = operators[-1].bias if hasattr(operators[-1], 'bias') else \
-            torch.zeros(self.out_shape, device=inp_example.device, dtype=inp_example.dtype)
+        self.out_shape = (*batch_shape, *cout.shape[1:])
+        self.bias = cbias
 
     @staticmethod
     def fold_batches(inp):
@@ -818,14 +820,14 @@ class CompositeLinearOp:
         """
         Return the bias with the correct unsqueezed shape.
         """
-        return self.bias
+        return self.bias.unsqueeze(1)
 
     def get_unconditioned_bias(self):
         """
         Return the bias (without first layer pre-conditioning) with the correct unsqueezed shape.
         As this class does not deal with the first layer, which is conditioned, returns the only bias.
         """
-        return self.get_bias()
+        return self.get_bias().unsqueeze(1)
 
     def __repr__(self):
         return f"CompositeLinearOp of {self.operators}"
@@ -841,7 +843,7 @@ def get_relu_mask(lb, ub):
 
 
 def create_final_coeffs_slice(start_batch_index, end_batch_index, batch_size, nb_out, tensor_example, node_layer_shape,
-                              node=(-1, None), upper_bound=False):
+                              node=(-1, None), upper_bound=False, full_batch_asymmetric=False):
     # Given indices and specifications (batch size for BaB, number of output neurons, example of used tensor and shape
     # of current last layer), create a slice of final_coeffs for dual iterative solvers (auxiliary fake last layer
     # variables indicating which neurons to compute bounds for)
@@ -888,10 +890,14 @@ def create_final_coeffs_slice(start_batch_index, end_batch_index, batch_size, nb
         slice_indices = list(range(start_batch_index, end_batch_index))
         slice_coeffs = torch.zeros((len(slice_indices), nb_out),
                                    device=tensor_example.device, dtype=tensor_example.dtype)
-        slice_diag = slice_coeffs.diagonal(start_batch_index)
-        slice_diag[:] = -torch.ones_like(slice_diag)
-        slice_diag = slice_coeffs.diagonal(start_batch_index - nb_out)
-        slice_diag[:] = torch.ones_like(slice_diag)
+        if not full_batch_asymmetric:
+            slice_diag = slice_coeffs.diagonal(start_batch_index)
+            slice_diag[:] = -torch.ones_like(slice_diag)
+            slice_diag = slice_coeffs.diagonal(start_batch_index - nb_out)
+            slice_diag[:] = torch.ones_like(slice_diag)
+        else:
+            slice_diag = slice_coeffs.diagonal(start_batch_index)
+            slice_diag[:] = -torch.ones_like(slice_diag) if upper_bound else torch.ones_like(slice_diag)
         slice_coeffs = slice_coeffs.expand((batch_size, *slice_coeffs.shape))
         slice_coeffs = slice_coeffs.view((batch_size, slice_coeffs.size(1),) + node_layer_shape)
     return slice_coeffs

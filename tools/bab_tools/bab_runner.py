@@ -10,6 +10,7 @@ from plnn.proxlp_solver.propagation import Propagation
 from plnn.network_linear_approximation import LinearizedNetwork
 from plnn.anderson_linear_approximation import AndersonLinearizedNetwork
 from plnn.explp_solver.solver import ExpLP
+from plnn.naive_approximation import NaiveNetwork
 from plnn.branch_and_bound.branching_scores import BranchingChoice
 from adv_exp.mi_fgsm_attack_canonical_form import MI_FGSM_Attack_CAN
 import time
@@ -47,6 +48,9 @@ def bab(verif_layers, domain, return_dict, timeout, batch_size, method, tot_iter
         }
         intermediate_net = Propagation(cuda_verif_layers, type="alpha-crown", params=prop_params,
                                        max_batch=args.max_solver_batch)
+    elif args.looser_ib:
+        intermediate_net = Propagation(cuda_verif_layers, type="best_prop",
+                                       params={"best_among": ["KW", "naive"]}, max_batch=args.max_solver_batch)
     else:
         # use best of CROWN and KW as intermediate bounds
         intermediate_net = Propagation(cuda_verif_layers, type="best_prop", params={"best_among": ["KW", "crown"]},
@@ -311,6 +315,8 @@ def parse_bounding_algorithms(param_dict, cuda_verif_layers, nn_name):
                                   max_batch=max_solver_batch)
             elif method == "dual-anderson":
                 net = ExpLP(cuda_verif_layers, params=cdict.pop("params"), fixed_M=True, store_bounds_primal=True)
+            elif method == "naive":
+                net = NaiveNetwork(cuda_verif_layers)
             else:
                 raise IOError(f"Bounding algorithm {method} not supported by bab_from_json")
             cdict["net"] = net
@@ -327,7 +333,8 @@ def parse_bounding_algorithms(param_dict, cuda_verif_layers, nn_name):
 
 
 def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, instance_timeout=None,
-                  gpu=True, decision_bound=0, start_time=None):
+                  gpu=True, decision_bound=0, start_time=None, max_batches=None, return_bounds_if_timeout=False,
+                  return_ibs_root=False, precomputed_ibs=None):
 
     # Pass the parameters for the BaB code via a .json file, rather than through command line arguments.
     epsilon = 1e-4
@@ -366,7 +373,11 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
     with torch.no_grad():
         min_lb, min_ub, ub_point, nb_states = relu_bab(
             intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=epsilon, ub_method=adv_model,
-            timeout=timeout, max_cpu_subdomains=max_cpu_domains, start_time=start_time, early_terminate=early_terminate)
+            timeout=timeout, max_cpu_subdomains=max_cpu_domains, start_time=start_time, early_terminate=early_terminate,
+            max_batches=max_batches, return_bounds_if_timeout=return_bounds_if_timeout, return_ibs_root=return_ibs_root,
+            precomputed_ibs=precomputed_ibs)
+        if return_ibs_root:
+            return min_lb, min_ub
 
     if not (min_lb or min_ub or ub_point):
         return_dict["min_lb"] = None;
@@ -377,7 +388,7 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
     else:
         return_dict["min_lb"] = min_lb.cpu()
         return_dict["min_ub"] = min_ub.cpu()
-        return_dict["ub_point"] = ub_point.cpu()
+        return_dict["ub_point"] = ub_point.cpu() if ub_point is not None else None
         return_dict["nb_states"] = nb_states
 
 
@@ -465,6 +476,7 @@ def main():
 
     # Intermediate bounds related parameters.
     parser.add_argument('--tighter_ib', action='store_true', help='whether to get tighter ibs for all')
+    parser.add_argument('--looser_ib', action='store_true', help='whether to get looser ibs for all')
     parser.add_argument('--opt_ib', action='store_true', help='whether to optimise on selected ibs')
     parser.add_argument('--opt_ib_k', type=int, help='how many selected ibs to optimise over per layer', default=5)
     parser.add_argument('--fixed_ib', action='store_true', help='whether to compute IBs only at root')
@@ -480,14 +492,14 @@ def main():
         # load json file with parameters
         with open(args.json) as json_file:
             json_params = json.load(json_file)
-        dataset = json_params["bab"]["dataset"]
-        properties = json_params["bab"]["properties"][args.nn_name] if "properties" in json_params["bab"] else None
-        max_solver_batch = json_params["ibs"]["loose_ib"]["max_solver_batch"][args.nn_name]
+        if isinstance(json_params["ibs"]["loose_ib"]["max_solver_batch"], dict):
+            max_solver_batch = json_params["ibs"]["loose_ib"]["max_solver_batch"][args.nn_name]
+        else:
+            max_solver_batch = json_params["ibs"]["loose_ib"]["max_solver_batch"]
         del json_params
-    else:
-        dataset = args.dataset
-        properties = args.pdprops
-        max_solver_batch = args.max_solver_batch
+
+    dataset = args.dataset
+    properties = args.pdprops
 
     # initialize a file to record all results, record should be a pandas dataframe
     if dataset in ["cifar_oval", "cifar_oval_1vsall", "cifar_colt"]:
@@ -613,7 +625,6 @@ def main():
         if args.gurobi_p > 1:
             mp.set_start_method('spawn')  # for some reason, everything hangs w/o this
 
-    problem_id = []
     for new_idx, idx in enum_batch_ids:
 
         torch.cuda.empty_cache()
@@ -694,7 +705,8 @@ def main():
             if args.json:
                 with open(args.json) as json_file:
                     json_params = json.load(json_file)
-                bab_from_json(json_params, verif_layers, domain, return_dict, args.nn_name, gpu=gpu)
+                bab_from_json(json_params, verif_layers, domain, return_dict, args.nn_name, gpu=gpu,
+                              instance_timeout=args.timeout)
                 del json_params
             else:
                 bab(verif_layers, domain, return_dict, args.timeout, args.batch_size, args.method, args.tot_iter,
@@ -712,8 +724,17 @@ def main():
             # use best of naive interval propagation and KW as intermediate bounds
             if args.tighter_ib:
                 # use best of CROWN and KW as intermediate bounds
+                prop_params = {
+                    'nb_steps': 5,
+                    'initial_step_size': args.init_step,
+                    'step_size_decay': args.step_decay,
+                    'betas': (0.9, 0.999),
+                }
+                intermediate_net = Propagation(cuda_verif_layers, type="alpha-crown", params=prop_params,
+                                               max_batch=args.max_solver_batch)
+            elif args.looser_ib:
                 intermediate_net = Propagation(cuda_verif_layers, type="best_prop",
-                                               params={"best_among": ["KW", "crown"]}, max_batch=args.max_solver_batch)
+                                               params={"best_among": ["KW", "naive"]}, max_batch=args.max_solver_batch)
             else:
                 # use best of naive interval propagation and KW as intermediate bounds
                 intermediate_net = Propagation(cuda_verif_layers, type="best_prop",
@@ -750,11 +771,6 @@ def main():
         graph_df.loc[new_idx][f"BBran_{column_name}"] = bab_nb_states
         graph_df.loc[new_idx][f"BTime_{column_name}"] = bab_time
         graph_df.to_pickle(record_name)
-
-    print("count True", list(graph_df['BSAT_cifar_colt_eth_gammacrown_as']).count('True'))
-    print("count False", list(graph_df['BSAT_cifar_colt_eth_gammacrown_as']).count('False'))
-    print("count timeout", list(graph_df['BSAT_cifar_colt_eth_gammacrown_as']).count('timeout'))
-    print('problematic idx:', problem_id)
 
 
 if __name__ == '__main__':

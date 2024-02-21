@@ -1,0 +1,64 @@
+{
+  "bounding": {
+    "nets": [
+      {
+        "bounding_algorithm": "dual-anderson",
+        "params": 
+            {
+                "anderson_algorithm": "saddle",
+                "nb_iter": 4000,
+                "blockwise": false,
+                "step_size_dict": {
+                      "type": "fw",
+                      "fw_start": 10
+                  },
+                "init_params": {
+                    "nb_outer_iter": 500,
+                    "initial_step_size": 1e-2,
+                    "final_step_size": 1e-4,
+                    "betas": [0.9, 0.999],
+                    "M_factor": 1.0
+                },
+                "primal_init_params": {
+                    "nb_bigm_iter": 100,
+                    "nb_anderson_iter": 0,
+                    "initial_step_size": 1e-2,
+                    "final_step_size": 1e-5,
+                    "betas": [0.9, 0.999]
+                }
+            },
+        "auto_iters": true,
+        "batch_size": 150,
+        "hard_overhead": 200
+      }
+    ],
+    "do_ubs": false,
+    "parent_init": true
+  },
+
+  "ibs": {
+    "loose_ib": {
+      "bounding_algorithm": "propagation",
+       "params": {
+        "best_among": ["KW", "crown"]
+      },
+      "type": "best_prop",
+      "max_solver_batch": 15000
+    },
+    "tight_ib": null,
+    "fixed_ib": true,
+    "joint_ib": false
+  },
+
+  "branching": {
+    "heuristic_type": "SR",
+    "max_domains": 3000,
+    "bounding": {
+      "bounding_algorithm": "propagation",
+      "params": {
+        "best_among": ["KW", "crown"]
+      },
+      "type": "best_prop"
+    }
+  }
+}

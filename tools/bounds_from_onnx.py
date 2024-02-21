@@ -7,6 +7,7 @@ from plnn.branch_and_bound.relu_branch_and_bound import relu_bab
 from plnn.branch_and_bound.branching_scores import BranchingChoice
 import tools.bab_tools.vnnlib_utils as vnnlib_utils
 from tools.custom_torch_modules import Flatten
+from plnn.model import simplify_network
 
 import torch, copy
 
@@ -231,7 +232,7 @@ def compute_bounds():
         },
         'restrict_factor': 1.5
     }
-    activeset_net = ExpLP(layers, params=explp_params, fixed_M=True, store_bounds_primal=True)
+    activeset_net = ExpLP(exp_layers, params=explp_params, fixed_M=True, store_bounds_primal=True)
     prop_start = time.time()
     with torch.no_grad():
         activeset_net.build_model_using_bounds(exp_domain, (intermediate_lbs, intermediate_ubs))
@@ -253,7 +254,8 @@ def compute_bounds():
         weights[:, 0] = 1
         final.weight = torch.nn.Parameter(weights, requires_grad=False)
         final.bias = torch.nn.Parameter(torch.zeros(1).to(lb.device), requires_grad=False)
-        layers.append(final)
+        exp_layers.append(final)
+        exp_layers = simplify_network(exp_layers)
 
     timeout = 10  # time out BaB after 10s
     # Intermediate bounding specifications
@@ -276,19 +278,17 @@ def compute_bounds():
     }
     # Branching strategy specification
     branching_dict = {
-        'choice': "heuristic",
         'heuristic_type': "FSB",  # branching strategy from https://arxiv.org/abs/2104.06718
-        'hscoremin': True,
         'bounding': {"net": Propagation(
-            layers, type="best_prop", params={"best_among": ["KW", "crown"]}, max_batch=1000)},
-        'gnn_name': None, "max_domains": 50  # larger than the batch size, but not too much
+            exp_layers, type="best_prop", params={"best_among": ["KW", "crown"]}, max_batch=1000)},
+        "max_domains": 50  # larger than the batch size, but not too much
     }
     bab_start = time.time()
-    brancher = BranchingChoice(branching_dict, layers)
-    decision_threshold = 0.  # assumes the decision threshold on the property is 0
-    min_lb, min_ub, _, nb_states = relu_bab(
-        intermediate_dict, out_bounds_dict, brancher, domain, decision_threshold, timeout=timeout,
-        return_bounds_if_timeout=True)
+    brancher = BranchingChoice(branching_dict, exp_layers)
+    with torch.no_grad():
+        min_lb, min_ub, _, nb_states = relu_bab(
+            intermediate_dict, out_bounds_dict, brancher, exp_domain.squeeze(0), None, timeout=timeout,
+            return_bounds_if_timeout=True)
     bab_end = time.time()
     print(f"BaB Time: {bab_end - bab_start} -- n_branches {nb_states}")
     print(f"BaB LB: {min_lb.cpu()}")

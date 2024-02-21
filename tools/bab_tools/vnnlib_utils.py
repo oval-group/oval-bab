@@ -62,6 +62,8 @@ def onnx_to_pytorch(onnx_path, numerical_tolerance=1e-3):
         if isinstance(clayer, (nn.ConstantPad1d, nn.ConstantPad2d)):
             if sum(clayer.padding) == 0:
                 to_remove.append(idx)
+        if isinstance(clayer, nn.Linear) and clayer.bias.data.dim() > 1:
+            clayer.bias.data = clayer.bias.data.squeeze(0)
     for idx in to_remove:
         torch_layers.pop(idx)
 

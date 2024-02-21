@@ -219,7 +219,7 @@ class DualVars:
                                      new_sum_WkIlbetak)
 
     def anderson_oracle(self, lay_idx, weights, masked_ops, nubs, l_checks, u_checks, primal_vars,
-                        do_intermediates=True, random_mask=False):
+                        do_intermediates=True, random_mask=False, delete_d=False):
         """
         Given list of layers, primal variables (instance of SaddlePrimalVars), post activation bounds,
         compute and return the output of the Anderson oracle over the exponential family of beta variables.
@@ -266,6 +266,9 @@ class DualVars:
             Istar_k = torch.randint(0, 2, zk_shape + xkm1_shape, device=xk.device, dtype=torch.bool)
 
         if do_intermediates or random_mask:
+            if delete_d:
+                # save some memory
+                del d
             masked_op.set_mask(Istar_k)
             # ... and its gradient
             WI_xkm1 = masked_op.forward(unfolded_xkm1 if type(lin_k) in [utils.ConvOp, utils.BatchConvOp]

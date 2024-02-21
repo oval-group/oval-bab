@@ -177,7 +177,7 @@ class DualADAMStats:
         self.epsilon = 1e-8
 
     def active_set_adam_step(self, weights, masked_ops, step_size, outer_it, dual_vars, primal_vars, clbs, cubs, nubs,
-                             l_preacts, u_preacts, l_checks, u_checks, opt_args, precision=torch.float):
+                             l_preacts, u_preacts, l_checks, u_checks, opt_args, precision=torch.float, delete_d=False):
         """
         Take a projected ADAM step on the active set of dual variables, possibly adding new variables to the active set.
         Update performed in place on dual_vars.
@@ -308,7 +308,7 @@ class DualADAMStats:
                 # Compute most violated constraint at current primal minimizer.
                 masked_op, Istar_k, exp_k_grad, WIl, W1mIu, _ = dual_vars.anderson_oracle(
                     lay_idx, weights, masked_ops, nubs, l_checks, u_checks, primal_vars,
-                    random_mask=opt_args['random_cuts'])
+                    random_mask=opt_args['random_cuts'], delete_d=delete_d)
 
                 self.m1_sum_beta[lay_idx-1].append(torch.zeros_like(dual_vars.sum_beta[lay_idx]))
                 self.m2_sum_beta[lay_idx-1].append(torch.zeros_like(dual_vars.sum_beta[lay_idx]))

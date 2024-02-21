@@ -127,7 +127,7 @@ def prune_domains(domains, threshold):
     for i in range(len(domains)):
         if domains[i].lower_bound >= threshold:
             domains = domains[0:i]
-        break
+            break
     return domains
 
 
@@ -184,7 +184,8 @@ def dump_domains_to_file(domains, dumped_domain_filelblist, max_domains_cpu, blo
             if not os.access(dumping_folder, os.W_OK):
                 # If there is no write access to the dumping_folder, use the project directory instead
                 dumping_folder = "./current_domain_files/"
-            os.makedirs(dumping_folder)
+            if not os.path.exists(dumping_folder):
+                os.makedirs(dumping_folder)
         c_block = len(dumped_domain_filelblist)
         filename = dumping_folder + file_base + f"{c_block}"
         # Dump a block of domains.
@@ -225,7 +226,7 @@ def compute_last_bounds_sequentially(bounds_net, splitted_domain, splitted_lbs, 
         # Check primal feasibility and don't compute bounds if not satisfied
         clbs = [lbs[batch_idx].unsqueeze(0) for lbs in splitted_lbs]
         cubs = [ubs[batch_idx].unsqueeze(0) for ubs in splitted_ubs]
-        primal_feasibility = check_primal_infeasibility(clbs, cubs, clbs[-1], cubs[-1])
+        primal_feasibility = check_primal_infeasibility(clbs, cubs)
 
         if primal_feasibility.all():
             # Problem seems to be feasible, can compute bounds
@@ -253,17 +254,15 @@ def compute_last_bounds_sequentially(bounds_net, splitted_domain, splitted_lbs, 
     return splitted_lbs, splitted_ubs, dom_ub_point, dual_solutions
 
 
-def check_primal_infeasibility(dom_lb_all, dom_ub_all, dom_lb, dom_ub):
+def check_primal_infeasibility(dom_lb_all, dom_ub_all):
     """
-    Given intermediate bounds (lists of tensors) and final layer bounds, check whether these constitute an infeasible
-    primal problem.
+    Given lower/upper bounds (lists of tensors), check whether these constitute an infeasible primal problem.
     This is checked via the dual, which is unbounded (lbs are larger than ubs, as we don't go to convergence).
     """
     batch_shape = dom_lb_all[0].shape[:1]
     feasible_output = torch.ones((*batch_shape, 1), device=dom_lb_all[0].device, dtype=torch.bool)
     for c_lbs, c_ubs in zip(dom_lb_all, dom_ub_all):
         feasible_output = feasible_output & (c_ubs - c_lbs >= 0).view((*batch_shape, -1)).all(dim=-1, keepdim=True)
-    feasible_output = feasible_output & (dom_ub - dom_lb >= 0).view((*batch_shape, -1)).all(dim=-1, keepdim=True)
     return feasible_output
 
 

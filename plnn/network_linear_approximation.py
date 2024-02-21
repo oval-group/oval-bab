@@ -4,7 +4,7 @@ import time
 import torch
 
 from itertools import product
-from tools.custom_torch_modules import View, Flatten
+from tools.custom_torch_modules import View, Flatten, Add, Mul, Reshape
 from plnn.naive_approximation import NaiveNetwork
 from plnn.proxlp_solver.utils import get_relu_mask
 from plnn.branch_and_bound.utils import ParentInit
@@ -31,6 +31,8 @@ class LinearizedNetwork(NaiveNetwork):
 
         # dummy Parent Init: for Gurobi we're not using any
         self.children_init = ParentInit()
+        self.numerical_tolerance = 1e-6
+        self.bounds_num_tolerance = 1e-4
 
     def get_lower_bound(self, domain, force_optim=False):
         '''
@@ -233,6 +235,9 @@ class LinearizedNetwork(NaiveNetwork):
             self.model.update()
             self.active_planet_constraints = []
 
+        # Remove preprocessing before the network.
+        input_domain = self.handle_net_preprocessing(input_domain)
+
         self.input_domain = input_domain
         self.lower_bounds = [lbs.clone() for lbs in intermediate_bounds[0]]
         self.upper_bounds = [ubs.clone() for ubs in intermediate_bounds[1]]
@@ -263,11 +268,14 @@ class LinearizedNetwork(NaiveNetwork):
                 for neuron_idx in range(layer.weight.size(0)):
                     if not self.model_built:
                         lin_expr = layer.bias[neuron_idx].item()
-                        coeffs = layer.weight[neuron_idx, :]
-                        lin_expr += grb.LinExpr(coeffs, pre_vars)
+                        for coeff, pre_var in zip(layer.weight[neuron_idx, :], pre_vars):
+                            if abs(coeff) > self.numerical_tolerance:
+                                lin_expr += coeff.item() * pre_var
 
-                        v = self.model.addVar(lb=self.lower_bounds[x_idx][neuron_idx],
-                                              ub=self.upper_bounds[x_idx][neuron_idx],
+                        pre_lb, pre_ub = self.clamp_bounds_diff(
+                            self.lower_bounds[x_idx][neuron_idx], self.upper_bounds[x_idx][neuron_idx])
+                        v = self.model.addVar(lb=pre_lb,
+                                              ub=pre_ub,
                                               obj=0,
                                               vtype=grb.GRB.CONTINUOUS,
                                               name=f'lay{layer_idx}_{neuron_idx}')
@@ -307,11 +315,16 @@ class LinearizedNetwork(NaiveNetwork):
                                                 # This is padding -> value of 0
                                                 continue
                                             coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
+                                            if abs(coeff) < self.numerical_tolerance:
+                                                continue
                                             lin_expr += coeff * self.gurobi_x_vars[x_idx - 1][in_chan_idx][in_row_idx][
                                                 in_col_idx]
 
-                                v = self.model.addVar(lb=self.lower_bounds[x_idx][out_chan_idx][out_row_idx][out_col_idx],
-                                                      ub=self.upper_bounds[x_idx][out_chan_idx][out_row_idx][out_col_idx],
+                                pre_lb, pre_ub = self.clamp_bounds_diff(
+                                    self.lower_bounds[x_idx][out_chan_idx][out_row_idx][out_col_idx],
+                                    self.upper_bounds[x_idx][out_chan_idx][out_row_idx][out_col_idx])
+                                v = self.model.addVar(lb=pre_lb,
+                                                      ub=pre_ub,
                                                       obj=0, vtype=grb.GRB.CONTINUOUS,
                                                       name=f'lay{layer_idx}_[{out_chan_idx}, {out_row_idx}, {out_col_idx}]')
                                 self.model.addConstr(v == lin_expr)
@@ -336,8 +349,10 @@ class LinearizedNetwork(NaiveNetwork):
                         for row_idx, row in enumerate(channel):
                             row_vars = []
                             for col_idx, pre_var in enumerate(row):
-                                pre_lb = self.lower_bounds[x_idx][chan_idx, row_idx, col_idx].item()
-                                pre_ub = self.upper_bounds[x_idx][chan_idx, row_idx, col_idx].item()
+                                pre_lb, pre_ub = self.clamp_bounds_diff(
+                                    self.lower_bounds[x_idx][chan_idx, row_idx, col_idx],
+                                    self.upper_bounds[x_idx][chan_idx, row_idx, col_idx])
+                                pre_lb, pre_ub = pre_lb.item(), pre_ub.item()
 
                                 if not self.model_built:
                                     v = self.model.addVar(lb=max(0, pre_lb),
@@ -373,8 +388,8 @@ class LinearizedNetwork(NaiveNetwork):
                     # Linear layer before ReLU.
                     assert isinstance(self.prerelu_gurobi_vars[x_idx][0], grb.Var)
                     for neuron_idx, pre_var in enumerate(self.prerelu_gurobi_vars[x_idx]):
-                        pre_lb = self.lower_bounds[x_idx][neuron_idx]
-                        pre_ub = self.upper_bounds[x_idx][neuron_idx]
+                        pre_lb, pre_ub = self.clamp_bounds_diff(
+                            self.lower_bounds[x_idx][neuron_idx], self.upper_bounds[x_idx][neuron_idx])
 
                         if not self.model_built:
                             v = self.model.addVar(lb=max(0, pre_lb),
@@ -463,6 +478,9 @@ class LinearizedNetwork(NaiveNetwork):
             # algorithm. This line of code imposes that.
             self.model.setParam('Method', 1)  # 1 means dual simplex
 
+        # Remove preprocessing before the network.
+        input_domain = self.handle_net_preprocessing(input_domain)
+
         ## Do the input layer, which is a special case
         zero_var = self.model.addVar(lb=0, ub=0, obj=0,
                                      vtype=grb.GRB.CONTINUOUS,
@@ -518,8 +536,9 @@ class LinearizedNetwork(NaiveNetwork):
 
                 for neuron_idx in range(layer.weight.size(0)):
                     lin_expr = layer.bias[neuron_idx].item()
-                    coeffs = layer.weight[neuron_idx, :]
-                    lin_expr += grb.LinExpr(coeffs, pre_vars)
+                    for coeff, pre_var in zip(layer.weight[neuron_idx, :], pre_vars):
+                        if abs(coeff) > self.numerical_tolerance:
+                            lin_expr += coeff.item() * pre_var
 
                     out_lb = out_lbs[neuron_idx].item()
                     out_ub = out_ubs[neuron_idx].item()
@@ -611,7 +630,7 @@ class LinearizedNetwork(NaiveNetwork):
                                             # This is padding -> value of 0
                                             continue
                                         coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
-                                        if abs(coeff) > 1e-6:
+                                        if abs(coeff) > self.numerical_tolerance:
                                             lin_expr += coeff * self.gurobi_x_vars[-1][in_chan_idx][in_row_idx][in_col_idx]
 
                             out_lb = out_lbs[0, out_chan_idx, out_row_idx, out_col_idx].item()
@@ -669,8 +688,9 @@ class LinearizedNetwork(NaiveNetwork):
                             row_lbs = []
                             row_ubs = []
                             for col_idx, pre_var in enumerate(row):
-                                pre_lb = pre_lbs[chan_idx, row_idx, col_idx].item()
-                                pre_ub = pre_ubs[chan_idx, row_idx, col_idx].item()
+                                pre_lb, pre_ub = self.clamp_bounds_diff(
+                                    pre_lbs[chan_idx, row_idx, col_idx], pre_ubs[chan_idx, row_idx, col_idx])
+                                pre_lb, pre_ub = pre_lb.item(), pre_ub.item()
 
                                 if pre_lb >= 0 and pre_ub >= 0:
                                     # ReLU is always passing
@@ -697,8 +717,8 @@ class LinearizedNetwork(NaiveNetwork):
                 else:
                     assert isinstance(self.gurobi_x_vars[-1][0], grb.Var)
                     for neuron_idx, pre_var in enumerate(self.gurobi_x_vars[-1]):
-                        pre_lb = self.lower_bounds[-1][neuron_idx]
-                        pre_ub = self.upper_bounds[-1][neuron_idx]
+                        pre_lb, pre_ub = self.clamp_bounds_diff(
+                            self.lower_bounds[-1][neuron_idx], self.upper_bounds[-1][neuron_idx])
 
                         v = self.model.addVar(lb=max(0, pre_lb),
                                               ub=max(0, pre_ub),
@@ -822,6 +842,35 @@ class LinearizedNetwork(NaiveNetwork):
                     for k in range(inp_size[2]):
                         mini_inp[i, j, k] = self.gurobi_x_vars[0][i][j][k].x
         return mini_inp.unsqueeze(0)
+
+    def handle_net_preprocessing(self, input_domain):
+        # Remove preprocessing before the network.
+        def input_applier(fn, input_domain):
+            out = []
+            for i in range(input_domain.shape[-1]):
+                out.append(fn(input_domain.select(-1, i).unsqueeze(0)).squeeze(0))
+            out = torch.stack(out, dim=-1)
+            return out
+        new_layers = []
+        for idx, clayer in enumerate(self.layers):
+            if isinstance(clayer, (nn.Linear, nn.Conv2d)):
+                new_layers.extend(self.layers[idx:])
+                break
+            if isinstance(clayer, (Flatten, Mul, Add, Reshape)):
+                input_domain = input_applier(clayer, input_domain)
+        self.layers = new_layers
+        return input_domain
+
+    def clamp_bounds_diff(self, c_lb, c_ub):
+        if (c_ub - c_lb) < self.bounds_num_tolerance:
+            c_ub += self.bounds_num_tolerance
+            if c_ub - self.bounds_num_tolerance <= 0:
+                c_ub = min(0, c_ub)
+            c_lb -= self.bounds_num_tolerance
+            if c_lb + self.bounds_num_tolerance >= 0:
+                c_lb = max(0, c_lb)
+        return c_lb, c_ub
+
 
 def optimize_model(model, grb, time_budget):
     model.update()

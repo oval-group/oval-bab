@@ -1,6 +1,7 @@
 from torch import nn
 import torch
 import numpy as np
+import copy
 
 
 class Flatten(nn.Module):
@@ -87,9 +88,13 @@ class Add(nn.Module):
         return inp - self.const
 
     def cuda(self, device=None):
-        # Manually provide inverse operator.
         super().cuda()
         self.const = self.const.cuda(device)
+        return self
+
+    def cpu(self):
+        super().cpu()
+        self.const = self.const.cpu()
         return self
 
 
@@ -106,10 +111,56 @@ class Mul(nn.Module):
         return inp / self.const
 
     def cuda(self, device=None):
-        # Manually provide inverse operator.
         super().cuda()
         self.const = self.const.cuda(device)
         return self
+
+    def cpu(self):
+        super().cpu()
+        self.const = self.const.cpu()
+        return self
+
+
+def unify_math_transforms(m_transforms, additive, multiplicative):
+    for op in m_transforms:
+        if isinstance(op, Add):
+            # ax + b ->  ax + b + c = a x + (b + c)
+            additive += op.const
+        elif isinstance(op, Mul):
+            # ax + b -> c( ax + b) = c a x + bc
+            multiplicative *= op.const
+            additive *= op.const
+        else:
+            raise ValueError('expected Add or Mul within unify_math_transforms.')
+    return additive, multiplicative
+
+
+def build_unified_math_transforms(layers, to_skip_count):
+    operators = []
+    for count, clayer in enumerate(layers):
+        if isinstance(clayer, nn.ReLU) or isinstance(clayer, (nn.Linear, nn.Conv2d)):
+            break
+        if isinstance(clayer, math_transforms):
+            operators.append(clayer)
+        else:
+            raise ValueError(f'unexpected operator {clayer} while processing add/mul')
+        to_skip_count += 1
+    if len(operators) > 0:
+        additive, multiplicative = unify_math_transforms(operators, 0., 1.)
+        return (additive, multiplicative), to_skip_count
+    else:
+        return None, to_skip_count
+
+
+def parse_post_linear_math_transform(layer, additive, multiplicative):
+    assert isinstance(layer, (nn.Linear, nn.Conv2d))
+    with torch.no_grad():
+        layer = copy.deepcopy(layer)
+        multiplicative = multiplicative.squeeze()
+        additive = additive.squeeze()
+        layer.weight *= multiplicative.view(multiplicative.shape + (1,)*(layer.weight.dim() - multiplicative.dim()))
+        layer.bias.data = layer.bias.data * multiplicative + additive
+    return layer
 
 
 supported_transforms = (Transpose, Reshape, Flatten, Add, Mul)

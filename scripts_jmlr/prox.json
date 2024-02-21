@@ -1,0 +1,52 @@
+{
+  "bounding": {
+    "nets": [
+      {
+        "bounding_algorithm": "prox",
+        "params": {
+                "nb_total_steps": 400,
+                "max_nb_inner_steps": 2,
+                "initial_eta": 1e1,
+                "final_eta": 5e2,
+                "log_values": false,
+                "inner_cutoff": 0,
+                "maintain_primal": true,
+                "acceleration_dict": {
+                    "momentum": 0.3
+                }
+          },
+        "auto_iters": true,
+        "batch_size": 150,
+        "hard_overhead": 200
+      }
+    ],
+    "do_ubs": false,
+    "parent_init": true
+  },
+
+  "ibs": {
+    "loose_ib": {
+      "bounding_algorithm": "propagation",
+       "params": {
+        "best_among": ["KW", "crown"]
+      },
+      "type": "best_prop",
+      "max_solver_batch": 15000
+    },
+    "tight_ib": null,
+    "fixed_ib": true,
+    "joint_ib": false
+  },
+
+  "branching": {
+    "heuristic_type": "SR",
+    "max_domains": 3000,
+    "bounding": {
+      "bounding_algorithm": "propagation",
+      "params": {
+        "best_among": ["KW", "crown"]
+      },
+      "type": "best_prop"
+    }
+  }
+}

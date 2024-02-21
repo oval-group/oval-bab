@@ -9,10 +9,10 @@ from tools.colt_layers import Conv2d, Normalization, ReLU, Linear, Sequential
 from tools.colt_layers import Flatten as flatten
 import numpy as np
 from plnn.proxlp_solver.propagation import Propagation
+from plnn.naive_approximation import NaiveNetwork
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
-# TODO: remove OVAL+ from verification_properties and code? Same with OVAL COLT?
 '''
 Code adapted from GNN_branching (author: Jingyue Lu)
 This file contains all model structures we have considered
@@ -164,12 +164,12 @@ def cifar_model_m1():
     )
     return model
 
-def add_single_prop(layers, gt, cls):
+def add_single_prop(layers, gt, cls, num_classes=10):
     '''
     gt: ground truth lable
     cls: class we want to verify against
     '''
-    additional_lin_layer = nn.Linear(10, 1, bias=True)
+    additional_lin_layer = nn.Linear(num_classes, 1, bias=True)
     lin_weights = additional_lin_layer.weight.data
     lin_weights.fill_(0)
     lin_bias = additional_lin_layer.bias.data
@@ -177,7 +177,6 @@ def add_single_prop(layers, gt, cls):
     lin_weights[0, cls] = -1
     lin_weights[0, gt] = 1
 
-    #verif_layers2 = flatten_layers(verif_layers1,[1,14,14])
     final_layers = [layers[-1], additional_lin_layer]
     final_layer  = simplify_network(final_layers)
     verif_layers = layers[:-1] + final_layer
@@ -374,7 +373,8 @@ def reluified_max_pool(candi_tot, lb_abs, flip_out_sign=False, dtype=torch.float
     return layers
 
 
-def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000, use_ib=False, gpu=True):
+def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000, use_ib=False, gpu=True,
+                          num_classes=10):
     """
         Given a pre-trained PyTorch network given by model, the true_label (ground truth) and the input domain for the
         property, create a network encoding a 1 vs. all adversarial verification task.
@@ -389,12 +389,12 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
     diff_in = last_layer.out_features
     diff_out = last_layer.out_features - 1
     diff_layer = nn.Linear(diff_in, diff_out, bias=True)
-    temp_weight_diff = torch.eye(10)
+    temp_weight_diff = torch.eye(num_classes)
     temp_weight_diff[:, true_label] -= 1
-    all_indices = list(range(10))
+    all_indices = list(range(num_classes))
     all_indices.remove(true_label)
     weight_diff = temp_weight_diff[all_indices]
-    bias_diff = torch.zeros(9)
+    bias_diff = torch.zeros(num_classes-1)
 
     diff_layer.weight = Parameter(weight_diff, requires_grad=False)
     diff_layer.bias = Parameter(bias_diff, requires_grad=False)
@@ -408,7 +408,7 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
                                        params={"best_among": ["KW", "crown"]})
     else:
         # use IBP for intermediate bounds
-        intermediate_net = Propagation(verif_layers, max_batch=max_solver_batch, type="naive")
+        intermediate_net = NaiveNetwork(verif_layers)
     verif_domain = domain.cuda().unsqueeze(0) if gpu else domain.unsqueeze(0)
     intermediate_net.define_linear_approximation(verif_domain, override_numerical_errors=True)
     lbs = intermediate_net.lower_bounds[-1].squeeze(0).cpu()
@@ -568,7 +568,8 @@ def get_network(dataset, device, net_name, net_loc, input_size, input_channel, n
         linear_size = int(tokens[5])
         net = ConvMedBig(device, dataset, n_class, input_size, input_channel, width1, width2, width3, linear_size=linear_size)
         net = net.to(device)
-        net.load_state_dict(torch.load(net_loc))
+        if net_loc is not None:
+            net.load_state_dict(torch.load(net_loc))
 
         new_net = convmedbig_colt_to_pytorch(n_class, input_size, input_channel, width1=width1, width2=width2, width3=width3, linear_size=linear_size)
         copyParams(net, new_net)
@@ -612,18 +613,9 @@ def load_1toall_eth(dataset, model, idx = None, test = None, eps_temp=None, max_
     image= np.float64(current_test[1:len(current_test)])/np.float64(255)
     y=np.int(current_test[0])
     if dataset == "cifar_colt":
-        # x = normalize(torch.from_numpy(np.array(image, dtype=np.float32).reshape([1, 3, 32, 32])).float())
         x = normalize(torch.from_numpy(np.array(image, dtype=np.float32).reshape([1, 32, 32, 3]).transpose(0,3,1,2)), dataset)
     elif dataset == "mnist_colt":
         x = normalize(torch.from_numpy(np.array(image, dtype=np.float32).reshape([1, 1, 28, 28])).float(), dataset)
-    # import torchvision.datasets as datasets
-    # import torchvision.transforms as transforms
-    # normalize_d = transforms.Normalize(mean=[0.1307],
-    #                                      std=[0.3081])
-    # mnist_test = datasets.MNIST('./data/', train=False, download=True,
-    #                               transform=transforms.Compose([transforms.ToTensor(), normalize_d]))
-    # x,y = mnist_test[3]
-    # x = x.unsqueeze(0)
 
     # first check the model is correct at the input
     y_pred = torch.max(model(x)[0], 0)[1].item()

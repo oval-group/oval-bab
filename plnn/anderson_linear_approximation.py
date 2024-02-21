@@ -1,5 +1,5 @@
 from plnn.network_linear_approximation import LinearizedNetwork
-from tools.custom_torch_modules import View, Flatten
+from tools.custom_torch_modules import View, Flatten, Add, Mul, Reshape
 from plnn.proxlp_solver.utils import prod, OptimizationTrace
 from plnn.branch_and_bound.utils import ParentInit
 from plnn.proxlp_solver.solver import SaddleLP
@@ -75,8 +75,6 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
 
         self.store_bounds_progress = store_bounds_progress
         self.logger = OptimizationTrace()
-
-        self.bounds_num_tolerance = 1e-4
         self.insert_cuts = True
 
         # dummy Parent Init: for Gurobi we're not using any
@@ -90,7 +88,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             if layer_idx == 0:
                 continue
 
-            if type(layer) not in [nn.Conv2d, nn.Linear, nn.ReLU, Flatten, View]:
+            if type(layer) not in [nn.Conv2d, nn.Linear, nn.ReLU, Flatten, View, Add, Mul, Reshape]:
                 raise ValueError("{} does not support layer type {}".format(type(self), type(layer)))
 
             previous_layer = self.layers[layer_idx-1]
@@ -333,6 +331,9 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             self.applied_cuts = 0
             self.old_applied_cuts = -1
 
+        # Remove preprocessing before the network.
+        input_domain = self.handle_net_preprocessing(input_domain)
+
         self.input_domain = input_domain
         device = self.input_domain.device
         ## Do the input layer, which is a special case
@@ -390,13 +391,14 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                             powerset = list(chain.from_iterable(
                                 combinations(non_zero_indices, r) for r in range(1, len(non_zero_indices))))
 
+                        pre_lb, pre_ub = self.clamp_bounds_diff(preact_lower[neuron_idx], preact_upper[neuron_idx])
                         x_var, z_var, ambiguous_relu = self.add_anderson_relu_neuron(
                             x_idx,
                             layer_idx,
                             previous_layer,
                             neuron_idx,
-                            preact_lower[neuron_idx].item(),
-                            preact_upper[neuron_idx].item(),
+                            pre_lb,
+                            pre_ub,
                             preact_vars[neuron_idx],
                             non_zero_indices_set,
                             powerset
@@ -437,13 +439,16 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                             out_row_amb_relus = []
                             for out_col_idx in range(M_minus.size(3)):
 
+                                pre_lb, pre_ub = self.clamp_bounds_diff(
+                                    preact_lower[out_chan_idx][out_row_idx][out_col_idx],
+                                    preact_upper[out_chan_idx][out_row_idx][out_col_idx])
                                 x_var, z_var, ambiguous_relu = self.add_anderson_relu_neuron(
                                     x_idx,
                                     layer_idx,
                                     previous_layer,
                                     (out_chan_idx, out_row_idx, out_col_idx),
-                                    preact_lower[out_chan_idx][out_row_idx][out_col_idx].item(),
-                                    preact_upper[out_chan_idx][out_row_idx][out_col_idx].item(),
+                                    pre_lb.item(),
+                                    pre_ub.item(),
                                     preact_vars[out_chan_idx][out_row_idx][out_col_idx],
                                     non_zero_indices_set,
                                     powerset
@@ -477,7 +482,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 continue
             elif type(layer) == Flatten:
                 continue
-            else:
+            elif not isinstance(layer, (nn.Conv2d, nn.Linear)):
                 raise NotImplementedError
 
         if (x_idx_max < 0 or x_idx <= x_idx_max):
@@ -696,14 +701,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 # Avoid numerical instability: on Wide one neuron has ub-lb = 1e-7
                 c_lb = self.pre_lower_bounds[x_idx - 1][neuron_idx]
                 c_ub = self.pre_upper_bounds[x_idx - 1][neuron_idx]
-                bound_diff = c_ub - c_lb
-                if bound_diff < self.bounds_num_tolerance:
-                    c_ub += self.bounds_num_tolerance
-                    if c_ub - self.bounds_num_tolerance <= 0:
-                        c_ub = min(0, c_ub)
-                    c_lb -= self.bounds_num_tolerance
-                    if c_lb + self.bounds_num_tolerance >= 0:
-                        c_lb = max(0, c_lb)
+                c_lb, c_ub = self.clamp_bounds_diff(c_lb, c_ub)
                 if not self.model_built:
                     lin_expr = self.get_layer_linear_expression(layer, x_km1_vars, neuron_idx, grb)
                     x_var = self.model.addVar(lb=c_lb,
@@ -850,14 +848,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                         # Avoid numerical instability: on Wide one neuron has ub-lb = 1e-7
                         c_lb = self.pre_lower_bounds[x_idx - 1][out_chan_idx][out_row_idx][out_col_idx]
                         c_ub = self.pre_upper_bounds[x_idx - 1][out_chan_idx][out_row_idx][out_col_idx]
-                        bound_diff = c_ub - c_lb
-                        if bound_diff < self.bounds_num_tolerance:
-                            c_ub += self.bounds_num_tolerance
-                            if c_ub - self.bounds_num_tolerance <= 0:
-                                c_ub = min(0, c_ub)
-                            c_lb -= self.bounds_num_tolerance
-                            if c_lb + self.bounds_num_tolerance >= 0:
-                                c_lb = max(0, c_lb)
+                        c_lb, c_ub = self.clamp_bounds_diff(c_lb, c_ub)
                         if not self.model_built:
                             # Compute W_k * x_{k-1} + b_k, as a Gurobi linear expression.
                             lin_expr = self.get_layer_linear_expression(layer, x_km1_vars,
@@ -1027,8 +1018,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 self.lb_input = self.get_input_list()
         return out
 
-    @staticmethod
-    def get_layer_linear_expression(layer, x_km1_vars, out_coordinates, grb, custom_bias=None, custom_forward=False):
+    def get_layer_linear_expression(self, layer, x_km1_vars, out_coordinates, grb, custom_bias=None, custom_forward=False):
         """
         Compute Gurobi linear expression for a layer with a linear operation (Linear or Conv2d), for the neuron identified
         by the out_coordinates.
@@ -1045,11 +1035,14 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             neuron_idx = out_coordinates
             lin_expr = layer.bias[neuron_idx].item() if custom_bias is None else custom_bias
             if not custom_forward:
-                lin_expr += grb.LinExpr(layer.weight[neuron_idx, :], x_km1_vars)
+                lin_expr = layer.bias[neuron_idx].item()
+                for coeff, pre_var in zip(layer.weight[neuron_idx, :], x_km1_vars):
+                    if abs(coeff) > self.numerical_tolerance:
+                        lin_expr += coeff.item() * pre_var
             else:
                 for idx, carg in enumerate(x_km1_vars):
                     coeff = layer.weight[neuron_idx, idx]
-                    if abs(coeff) > 1e-6:
+                    if abs(coeff) > self.numerical_tolerance:
                         lin_expr += coeff * carg
 
         elif type(layer) is nn.Conv2d:
@@ -1070,7 +1063,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                             # This is padding -> value of 0
                             continue
                         coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
-                        if abs(coeff) > 1e-6:
+                        if abs(coeff) > self.numerical_tolerance:
                             lin_expr += coeff * x_km1_vars[in_chan_idx][in_row_idx][in_col_idx]
         else:
             ValueError("Linear expression computation implemented only for linear or convolutional layers")
@@ -1386,7 +1379,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                             # This is padding -> value of 0
                             continue
                         coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
-                        if abs(coeff) > 1e-6:
+                        if abs(coeff) > self.numerical_tolerance:
                             c_l_breve_km1 = l_km1[0, in_chan_idx, in_row_idx, in_col_idx].item() if coeff >= 0 \
                                 else u_km1[0, in_chan_idx, in_row_idx, in_col_idx].item()
                             c_u_breve_km1 = u_km1[0, in_chan_idx, in_row_idx, in_col_idx].item() if coeff >= 0 \
@@ -1417,7 +1410,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
                 c_l_breve_km1 = l_km1[0, in_chan_idx, in_row_idx, in_col_idx].item() if coeff >= 0 \
                     else u_km1[0, in_chan_idx, in_row_idx, in_col_idx].item()
-                if abs(coeff) > 1e-6:
+                if abs(coeff) > self.numerical_tolerance:
                     if self.mode == "lp-cut":
                         c_x = x_km1_values[in_chan_idx][in_row_idx][in_col_idx]
                     else:
@@ -1434,7 +1427,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
                 c_u_breve_km1 = u_km1[0, in_chan_idx, in_row_idx, in_col_idx].item() if coeff >= 0 \
                     else l_km1[0, in_chan_idx, in_row_idx, in_col_idx].item()
-                if abs(coeff) > 1e-6:
+                if abs(coeff) > self.numerical_tolerance:
                     constraint_value += coeff * c_u_breve_km1 * z_value
 
         else:
@@ -1495,7 +1488,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
                 c_l_breve_km1 = l_km1[0, in_chan_idx, in_row_idx, in_col_idx] if coeff >= 0 else u_km1[
                     0, in_chan_idx, in_row_idx, in_col_idx]
-                if abs(coeff) > 1e-6:
+                if abs(coeff) > self.numerical_tolerance:
                     tighten_expression += coeff * (
                                 x_km1_vars[in_chan_idx][in_row_idx][in_col_idx] - c_l_breve_km1.item() * (1 - z_var))
 
@@ -1510,7 +1503,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
                 c_u_breve_km1 = u_km1[0, in_chan_idx, in_row_idx, in_col_idx] if coeff >= 0 else l_km1[
                     0, in_chan_idx, in_row_idx, in_col_idx]
-                if abs(coeff) > 1e-6:
+                if abs(coeff) > self.numerical_tolerance:
                     u_breve_sum += coeff * c_u_breve_km1.item()
 
             tighten_expression += z_var * (layer.bias[out_chan_idx].item() + u_breve_sum)

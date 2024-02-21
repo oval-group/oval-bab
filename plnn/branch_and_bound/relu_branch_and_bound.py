@@ -74,29 +74,37 @@ class ReLUDomain:
 
 def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=1e-4, early_terminate=False,
              ub_method=None, timeout=float("inf"), gurobi_dict=None, max_cpu_subdomains=None, start_time=None,
-             return_bounds_if_timeout=False):
+             return_bounds_if_timeout=False, max_batches=None, return_ibs_root=False, precomputed_ibs=None):
     '''
     Uses branch and bound algorithm to evaluate the global minimum
     of a given neural network. Splits according to KW.
     Does ReLU activation splitting (not domain splitting, the domain will remain the same throughout)
 
     Assumes that the last layer is a single neuron.
-    # TODO: better documentation for the dictionaries, whose structure can be seen in the json files in bab_configs/
 
-    `intermediate_net`: Neural Network class, defining the `get_upper_bound`, `define_linear_approximation` functions.
-                        Network used to get intermediate bounds.
-    `bounds_net`      : Neural Network class, defining the `get_upper_bound`, `define_linear_approximation` functions.
-                        Network used to get the final layer bounds, given the intermediate ones.
+    `intermediate_dict`: dictionary containing classes pertaining to intermediate bound computations,
+                         see tools/bounds_from_onnx.py and json files in bab_configs/
+    `out_bounds_dict`: dictionary containing classes pertaining to output bound computations,
+                         see tools/bounds_from_onnx.py and json files in bab_configs/
+    `brancher`: instance of BranchingChoice used to compute the branching decisions
     `ub_method'      : Class to run adversarial attacks to create an UB
     `eps`           : Maximum difference between the UB and LB over the minimum
                       before we consider having converged
-    `decision_bound`: If not None, stop the search if the UB and LB are both
-                      superior or both inferior to this value.
+    `domain`: the interval domain of the BaB problem (lower and upper bounds provided as entries in the last dim)
+    `decision_bound`: If not None, stop the search if the UB and LB are both superior or both inferior to this value.
     `batch_size`: The number of domain lower/upper bounds computations done in parallel at once (on a GPU) is
                     batch_size*2
     `gurobi_dict`: dictionary containing whether ("gurobi") gurobi needs to be used (executes on "p" cpu)
     `early_terminate`: use heuristic for early termination in case of almost certain timeout
-    'max_cpu_subdomains': how many subdomains we can store in cpu memory
+    `max_cpu_subdomains`: how many subdomains we can store in cpu memory
+    `timeout`: number of seconds for which BaB can run
+    `start_time`: timestamp for when to start counting timeout for (if None, computed internally)
+    `return_bounds_if_timeout`: whether to return the LB/UB on the global minimum in case of timeout
+    `max_batches`: whether to only run BaB only for at most max_batches batch iterations
+    `return_ibs_root`: whether to return the IBs computed for the root node (useful in case BaB is called multiple
+                       times on the same network)
+    `precomputed_ibs`: provides a tuple of lists with (lower_bounds, upper_bounds) for pre-computed intermediate bounds
+                       at the root (useful in case BaB is called multiple times on the same network)
     Returns         : Lower bound and Upper bound on the global minimum,
                       as well as the point where the upper bound is achieved
     '''
@@ -107,6 +115,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
     dumped_domain_blocksize = int(max_domains_cpu/2)
     n_stratifications = len(out_bounds_dict["nets"])
     stratified_bab = n_stratifications > 1  # whether to use two separate nets for last layer bounds
+    if decision_bound is None:
+        early_terminate = False
 
     # Retrieve information concerning the first (and second, if available) last layer bounding network.
     current_net = 0
@@ -143,25 +153,48 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
     intermediate_ubs = copy.deepcopy(intermediate_net.upper_bounds)
     testnode_dict = None
 
-    if intermediate_lbs[-1] > decision_bound or intermediate_ubs[-1] < decision_bound:
+    if decision_bound is not None and (intermediate_lbs[-1] > decision_bound or intermediate_ubs[-1] < decision_bound):
         bab.join_children(gurobi_dict, timeout)
         print(f"Global LB: {intermediate_lbs[-1]}; Global UB: {intermediate_ubs[-1]}")
         return intermediate_lbs[-1], intermediate_ubs[-1], \
                torch.zeros_like(intermediate_net.lower_bounds[0]), nb_visited_states
 
-    if "tight_ib" in intermediate_dict and intermediate_dict["tight_ib"] is not None and \
-            intermediate_dict["tight_ib"]["net"] is not None:
-        # Compute tighter intermediate bounds for ambiguous neurons.
-        dummy_branching_log = {idx: [0] for idx in range(-1, len(intermediate_lbs) - 1)}
-        neurons_to_opt = {}
-        loose_layer_range = list(range(2, len(intermediate_lbs) - 1))
-        for lay_idx in loose_layer_range:
-            ambiguous = ((intermediate_lbs[lay_idx] < 0) & (intermediate_ubs[lay_idx] > 0)).view(1, -1)
-            max_ambiguous = ambiguous.sum(1).max().item()  # Max. no. of ambiguous activations across batches
-            neurons_to_opt[lay_idx] = torch.topk(ambiguous.type(intermediate_lbs[0].dtype), max_ambiguous)[1]
-        intermediate_bounds_subroutine(
-            intermediate_dict["tight_ib"]["net"], domain.unsqueeze(0), intermediate_lbs,
-            intermediate_ubs, loose_layer_range, dummy_branching_log, neurons_to_opt=neurons_to_opt)
+    if precomputed_ibs is None:
+        if "tight_ib" in intermediate_dict and intermediate_dict["tight_ib"] is not None and \
+                intermediate_dict["tight_ib"]["net"] is not None:
+            # Compute tighter intermediate bounds for ambiguous neurons.
+            dummy_branching_log = {idx: [0] for idx in range(-1, len(intermediate_lbs) - 1)}
+            neurons_to_opt = {}
+            loose_layer_range = list(range(2, len(intermediate_lbs) - 1))
+            for lay_idx in loose_layer_range:
+                ambiguous = ((intermediate_lbs[lay_idx] < 0) & (intermediate_ubs[lay_idx] > 0)).view(1, -1)
+                max_ambiguous = ambiguous.sum(1).max().item()  # Max. no. of ambiguous activations across batches
+                neurons_to_opt[lay_idx] = torch.topk(ambiguous.type(intermediate_lbs[0].dtype), max_ambiguous)[1]
+            intermediate_bounds_subroutine(
+                intermediate_dict["tight_ib"]["net"], domain.unsqueeze(0), intermediate_lbs,
+                intermediate_ubs, loose_layer_range, dummy_branching_log, neurons_to_opt=neurons_to_opt)
+
+            if decision_bound is not None and \
+                    (intermediate_lbs[-1] > decision_bound or intermediate_ubs[-1] < decision_bound):
+                bab.join_children(gurobi_dict, timeout)
+                print(f"Global LB: {intermediate_lbs[-1]}; Global UB: {intermediate_ubs[-1]}")
+                return intermediate_lbs[-1], intermediate_ubs[-1], \
+                    torch.zeros_like(intermediate_net.lower_bounds[0]), nb_visited_states
+    else:
+        # if tight pre-computed IBs are passed, no need to re-compute them
+        passed_lbs, passed_ubs = precomputed_ibs
+        for x_idx in range(min(len(passed_lbs), len(intermediate_lbs) - 1)):
+            # retain best bounds and update intermediate bounds from batch
+            intermediate_lbs[x_idx] = torch.max(passed_lbs[x_idx], intermediate_lbs[x_idx])
+            intermediate_ubs[x_idx] = torch.min(passed_ubs[x_idx], intermediate_ubs[x_idx])
+
+    primal_feasibility = bab.check_primal_infeasibility(intermediate_lbs, intermediate_ubs)
+    if not primal_feasibility.all():
+        print("********************************************* Numerically unstable property, skip")
+        return None, None, None, nb_visited_states
+
+    if return_ibs_root:
+        return intermediate_lbs, intermediate_ubs, None, None
 
     print('computing last layer bounds')
     # compute last layer bounds with a more expensive network
@@ -203,13 +236,14 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
 
     print(f"Global LB: {global_lb}; Global UB: {global_ub}")
     print('decision bound', decision_bound)
-    if global_lb > decision_bound or global_ub < decision_bound:
+    if decision_bound is not None and (global_lb > decision_bound or global_ub < decision_bound):
         bab.join_children(gurobi_dict, timeout)
         return global_lb, global_ub, global_ub_point, nb_visited_states
 
     candidate_domain = ReLUDomain(global_lb, global_ub, intermediate_lbs, intermediate_ubs,
                                   parent_solution=bounds_net.children_init,
-                                  dec_thr=decision_bound, hard_info=next_net_info, domain=domain.unsqueeze(0)).to_cpu()
+                                  dec_thr=(decision_bound if (decision_bound is not None) else global_ub.cpu()),
+                                  hard_info=next_net_info, domain=domain.unsqueeze(0)).to_cpu()
 
     domains = [candidate_domain]
     dumped_domain_filelblist = []  # store filenames and lbs for blocks of domains that are stored on disk
@@ -222,7 +256,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         n_iter += 1
         # Check if we have run out of time.
         # Timeout a bit earlier than necessary to account for the overhead of exiting the scope.
-        if (time.time() - start_time) + 1.10 * (bound_time + branch_time) > timeout:
+        if (time.time() - start_time) + 1.10 * (bound_time + branch_time) > timeout or \
+                (max_batches is not None and n_iter > max_batches):
             bab.join_children(gurobi_dict, timeout)
             bab.delete_dumped_domains(dumped_domain_filelblist)
             if return_bounds_if_timeout:
@@ -378,14 +413,11 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         batch_global_lb = torch.min(dom_lb, dim=0)[0]
         added_domains = 0
         for batch_idx in range(dom_lb.shape[0]):
-            # print('dom_lb: ', dom_lb[batch_idx])
-            # print('dom_ub: ', dom_ub[batch_idx])
 
-            if dom_lb[batch_idx] == float('inf') or dom_ub[batch_idx] == float('inf') or \
-                    dom_lb[batch_idx] > dom_ub[batch_idx]:
+            if dom_lb[batch_idx] == float('inf') or dom_ub[batch_idx] == float('inf'):
                 infeasible_count += 1
 
-            elif dom_lb[batch_idx] < min(global_ub, decision_bound):
+            elif dom_lb[batch_idx] < min(global_ub, (decision_bound if (decision_bound is not None) else global_ub)):
                 added_domains += 1
                 c_dom_lb_all = [lb[batch_idx].unsqueeze(0) for lb in dom_lb_all]
                 c_dom_ub_all = [ub[batch_idx].unsqueeze(0) for ub in dom_ub_all]
@@ -397,7 +429,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                         dom_lb[batch_idx].unsqueeze(0), dom_ub[batch_idx].unsqueeze(0), c_dom_lb_all,
                         c_dom_ub_all, parent_solution=c_dual_solutions,
                         parent_depth=depth_list[batch_idx], c_imp_avg=impr_avg_list[batch_idx],
-                        c_imp=dom_lb[batch_idx].item() - parent_lb_list[batch_idx].item(), dec_thr=decision_bound,
+                        c_imp=dom_lb[batch_idx].item() - parent_lb_list[batch_idx].item(),
+                        dec_thr=(decision_bound if (decision_bound is not None) else global_ub.cpu()),
                         hard_info=next_net_info, domain=domain_stack[batch_idx].unsqueeze(0)
                     ).to_cpu()
                 else:
@@ -425,7 +458,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
 
         # Remove domains clearly on the right side of the decision threshold: our goal is to which side of it is the
         # minimum, no need to know more for these domains.
-        prune_value = min(global_ub.cpu() - eps, decision_bound + eps)
+        prune_value = min(global_ub.cpu() - eps,
+                          (decision_bound if (decision_bound is not None) else global_ub.cpu()) + eps)
         domains = bab.prune_domains(domains, prune_value)
 
         # read/write domains from secondary memory if necessary.
@@ -442,8 +476,10 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                 global_lb = min(global_lb, dumped_lb_min)
         else:
             # If we've run out of domains, it means we included no newly splitted domain
-            global_lb = torch.ones_like(global_lb) * (decision_bound + eps) if batch_global_lb > global_ub \
-                else batch_global_lb
+            if batch_global_lb <= global_ub:
+                global_lb = batch_global_lb
+            elif decision_bound is not None:
+                global_lb = torch.ones_like(global_lb) * prune_value
 
         if harder_domains or next_net_buffer:
             harder_domains = bab.prune_domains(harder_domains, prune_value)
@@ -483,7 +519,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         # If early_terminate is True, we return early if we predict that the property won't be verified within the time
         # (if the estimated time to cross the decision threshold + to deplete the bounds goes over the timeout)
         t_to_timeout = timeout - (time.time() - start_time)
-        early_terminate_lhs = (decision_bound - global_lb) / expected_improvement + len(domains) / batch_size
+        early_terminate_lhs = ((decision_bound if (decision_bound is not None) else global_ub)
+                               - global_lb) / expected_improvement + len(domains) / batch_size
         # consider pickled domains
         early_terminate_lhs += len(dumped_domain_filelblist) * dumped_domain_blocksize / batch_size
         if next_net_info is not None:
@@ -499,14 +536,18 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
 
         # run attacks
         # Try falsification only in the first 50 batch iterations.
-        if ub_method is not None and global_ub > decision_bound and n_iter < 50:
+        if (ub_method is not None and ((decision_bound is None) or (global_ub > decision_bound))) and n_iter < 50:
             global_ub, global_ub_point = run_attack(ub_method, dom_ub, dom_ub_point, global_ub, global_ub_point)
+
+        if decision_bound is None:
+            domains = bab.prune_domains(domains, global_ub.cpu() - eps)
 
         print(f"Current: lb:{global_lb}\t ub: {global_ub}")
         # Stopping criterion
-        if global_lb >= decision_bound:
+        stop_value = (decision_bound if (decision_bound is not None) else (global_ub - eps))
+        if global_lb >= stop_value:
             break
-        elif global_ub < decision_bound:
+        elif global_ub < stop_value:
             break
 
     bab.join_children(gurobi_dict, timeout)
@@ -604,9 +645,9 @@ def compute_bounds(intermediate_dict, bounds_net, branching_layer_log, splitted_
     # TODO: do we need any alternative upper bounding strategy for the dual algorithms?
     dom_ub = bounds_net.net(dom_ub_point)
 
-    # check that the domain upper bound is larger than its lower bound. If not, infeasible domain.
-    # return +inf as a consequence to have the bound pruned.
-    primal_feasibility = bab.check_primal_infeasibility(dom_lb_all, dom_ub_all, dom_lb, dom_ub)
+    # check that all over-approximation-based upper bounds are larger than the corresponding lower bound.
+    # If not, infeasible domain, and return +inf to have the bound pruned.
+    primal_feasibility = bab.check_primal_infeasibility(dom_lb_all, dom_ub_all)
     dom_lb = torch.where(~primal_feasibility, float('inf') * torch.ones_like(dom_lb), dom_lb)
     dom_ub = torch.where(~primal_feasibility, float('inf') * torch.ones_like(dom_ub), dom_ub)
 

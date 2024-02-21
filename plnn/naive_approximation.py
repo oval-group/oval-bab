@@ -1,7 +1,9 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from tools.custom_torch_modules import Flatten, View, supported_transforms
+from tools.custom_torch_modules import shape_transforms, build_unified_math_transforms, \
+    parse_post_linear_math_transform, supported_transforms, Mul
+from plnn.proxlp_solver.utils import override_numerical_bound_errors
 
 
 class NaiveNetwork:
@@ -22,43 +24,49 @@ class NaiveNetwork:
         self.do_interval_analysis(domain)
         return self.lower_bounds[-1]
 
-    def do_interval_analysis(self, inp_domain):
+    def do_interval_analysis(self, inp_domain, override_numerical_errors=False, cdebug=False):
         self.lower_bounds = []
         self.upper_bounds = []
-
         self.lower_bounds.append(inp_domain.select(-1, 0))
         self.upper_bounds.append(inp_domain.select(-1, 1))
+
+        if cdebug:
+            l_0 = inp_domain.select(-1, 0)
+            u_0 = inp_domain.select(-1, 1)
+            inp_ex = (torch.zeros_like(l_0).uniform_() * (u_0 - l_0) + l_0).unsqueeze(0)
+            x = inp_ex
+
         layer_idx = 1
         current_lb = self.lower_bounds[-1]
         current_ub = self.upper_bounds[-1]
-        for layer in self.layers:
+        to_skip = 0
+        first_linear_done = False
+        for lay_idx, layer in enumerate(self.layers):
+            if to_skip > 0:
+                to_skip -= 1
+                continue
             if isinstance(layer, nn.Linear) or isinstance(layer, nn.Conv2d):
+                first_linear_done = True
+                # check if math operations trail this layer
+                post_linear_math_transform, to_skip = build_unified_math_transforms(self.layers[lay_idx + 1:], to_skip)
+                if post_linear_math_transform is not None:
+                    layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
+
+                abs_weights = torch.abs(layer.weight)
                 if type(layer) is nn.Linear:
-                    pos_weights = torch.clamp(layer.weight, min=0)
-                    neg_weights = torch.clamp(layer.weight, max=0)
+                    center = torch.mv(layer.weight, current_ub + current_lb) / 2 + layer.bias
+                    offset = torch.mv(abs_weights, current_ub - current_lb) / 2
+                else:
+                    center = F.conv2d((current_ub + current_lb).unsqueeze(0) / 2, layer.weight, layer.bias,
+                                      layer.stride, layer.padding, layer.dilation, layer.groups).squeeze(0)
+                    offset = F.conv2d((current_ub - current_lb).unsqueeze(0) / 2, abs_weights, None,
+                                      layer.stride, layer.padding, layer.dilation, layer.groups).squeeze(0)
 
-                    new_layer_lb = torch.mv(pos_weights, current_lb) + \
-                                   torch.mv(neg_weights, current_ub) + \
-                                   layer.bias
-                    new_layer_ub = torch.mv(pos_weights, current_ub) + \
-                                   torch.mv(neg_weights, current_lb) + \
-                                   layer.bias
-                elif type(layer) is nn.Conv2d:
-                    pre_lb = torch.Tensor(current_lb).unsqueeze(0)
-                    pre_ub = torch.Tensor(current_ub).unsqueeze(0)
-                    pos_weight = torch.clamp(layer.weight, 0, None)
-                    neg_weight = torch.clamp(layer.weight, None, 0)
+                new_layer_lb = center - offset
+                new_layer_ub = center + offset
 
-                    out_lbs = (F.conv2d(pre_lb, pos_weight, layer.bias,
-                                        layer.stride, layer.padding, layer.dilation, layer.groups)
-                               + F.conv2d(pre_ub, neg_weight, None,
-                                          layer.stride, layer.padding, layer.dilation, layer.groups))
-                    out_ubs = (F.conv2d(pre_ub, pos_weight, layer.bias,
-                                        layer.stride, layer.padding, layer.dilation, layer.groups)
-                               + F.conv2d(pre_lb, neg_weight, None,
-                                          layer.stride, layer.padding, layer.dilation, layer.groups))
-                    new_layer_lb = out_lbs.squeeze(0)
-                    new_layer_ub = out_ubs.squeeze(0)
+                if override_numerical_errors:
+                    new_layer_lb, new_layer_ub = override_numerical_bound_errors(new_layer_lb, new_layer_ub)
                 self.lower_bounds.append(new_layer_lb)
                 self.upper_bounds.append(new_layer_ub)
                 current_lb = new_layer_lb
@@ -99,14 +107,37 @@ class NaiveNetwork:
                 current_ub = new_ubs
                 self.lower_bounds.append(new_lbs)
                 self.upper_bounds.append(new_ubs)
-            elif type(layer) == View:
-                continue
-            elif isinstance(layer, (*supported_transforms, nn.AvgPool2d, nn.ConstantPad2d)):
-                # Simply propagate the linear operations forward
+            elif isinstance(layer, (*shape_transforms, nn.AvgPool2d, nn.ConstantPad2d)) or (
+                    not first_linear_done and isinstance(layer, supported_transforms)):
+                if isinstance(layer, Mul):
+                    # negative multiplications would need a more careful handling of the input bounds
+                    assert (layer.const >= 0).all()
+                # Simply propagate the operations forward
                 current_lb = layer(current_lb.unsqueeze(0)).squeeze(0)
                 current_ub = layer(current_ub.unsqueeze(0)).squeeze(0)
             else:
                 raise NotImplementedError
+            if cdebug:
+                x = layer(x)
+
+        if cdebug:
+            self._debug_forward(inp_ex, x)
+
+    def define_linear_approximation(self, inp_domain, override_numerical_errors=False, cdebug=False):
+        assert inp_domain.shape[0] == 1, "IBP does not support domain batching for now, " \
+                                         "use Propagation with type='naive'"
+        self.do_interval_analysis(
+            inp_domain.squeeze(0), override_numerical_errors=override_numerical_errors, cdebug=cdebug)
+        self.lower_bounds[0] = -torch.ones_like(self.lower_bounds[0])
+        self.upper_bounds[0] = torch.ones_like(self.upper_bounds[0])
+        for idx in range(len(self.lower_bounds)):
+            self.lower_bounds[idx] = self.lower_bounds[idx].unsqueeze(0)
+            self.upper_bounds[idx] = self.upper_bounds[idx].unsqueeze(0)
+
+    def compute_lower_bound(self, node=(-1, None), upper_bound=False, counterexample_verification=False,
+                            override_numerical_errors=False, full_batch_asymmetric=False):
+        raise NotImplementedError("compute_lower_bound not implemented for naive implementation of IBP for now,"
+                                  "use Propagation with type='naive'")
 
     def get_upper_bound_random(self, domain):
         '''
@@ -207,5 +238,8 @@ class NaiveNetwork:
                 inps = torch.min(inps, domain_ub)
 
         return best_ub_inp, best_ub
+
+    def _debug_forward(self, inp_ex, x, numerical_tolerance=1e-3):
+        assert (self.net(inp_ex) - x).abs().max() < numerical_tolerance
 
     get_upper_bound = get_upper_bound_random

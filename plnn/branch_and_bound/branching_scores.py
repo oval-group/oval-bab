@@ -1,6 +1,10 @@
 import torch
 from plnn.proxlp_solver.propagation import Propagation, PropInit
+from plnn.explp_solver.bigm_optimization import BigMPInit
+from plnn.explp_solver.solver import ExpLP
+from plnn.proxlp_solver.solver import SaddleLP, DecompositionPInit
 import math
+import functools
 
 
 class BranchingChoice:
@@ -16,11 +20,11 @@ class BranchingChoice:
         """
         # Store content of branch_dict as class attributes.
         for key in ['heuristic_type', 'bounding', 'max_domains']:
-            if key == "bounding":
+            if key == "bounding" and branch_dict[key] is not None:
                 self.__dict__[key] = branch_dict[key]["net"]
             else:
                 self.__dict__[key] = branch_dict[key]
-        if self.heuristic_type not in ["SR", "FSB", "input", "UPB"]:
+        if self.heuristic_type not in ["SR", "FSB", "input", "UPB", "SUPC"]:
             raise NotImplementedError(f"Branching heuristic {self.heuristic_type} not implemented.")
 
         # Set other parameters.
@@ -28,20 +32,23 @@ class BranchingChoice:
         self.sparsest_layer = sparsest_layer
 
         # Set SR-specific parameters and variables.
-        if self.heuristic_type in ["SR", "FSB", "UPB"]:
+        if self.heuristic_type in ["SR", "FSB", "UPB", "SUPC"]:
             self.icp_score_counter = 0
             # if the maximum score is below the threshold, we consider it to be non-informative
             self.decision_threshold = 0.001
-            self.upb_fallback_thr = 1e-4
+            self.dbi_fallback_thr = 1e-4
 
         # Set the branching function.
         branching_function_dict = {"SR": self.branch_sr, "FSB": self.branch_fsb,
-                                   "UPB": self.branch_upb, "input": self.branch_input_bab}
+                                   "UPB": functools.partial(self.branch_dual_bounds_info, "UPB"),
+                                   "SUPC": functools.partial(self.branch_dual_bounds_info, "SUPC"),
+                                   "input": self.branch_input_bab}
         self.branching_function = branching_function_dict[self.heuristic_type]
 
         # Set the splitting function.
         splitting_function_dict = {"SR": self.relu_split, "FSB": self.relu_split,
-                                   "UPB": self.relu_split, "input": self.input_split}
+                                   "UPB": self.relu_split, "input": self.input_split,
+                                   'SUPC': self.relu_split}
         self.splitting_function = splitting_function_dict[self.heuristic_type]
 
     def branch(self, domains, lower_bounds, upper_bounds, **kwargs):
@@ -299,55 +306,92 @@ class BranchingChoice:
 
         return branching_decision_list, impr
 
-    def branch_upb(self, domains, lower_bounds, upper_bounds, **kwargs):
+    def branch_dual_bounds_info(self, dtype, domains, lower_bounds, upper_bounds, **kwargs):
         '''
-        Split according to the contribution of the Upper Planet Bias (UPB) on the beta-CROWN (or alpha-CROWN) objective.
-        NOTE: if the current output bounding algorithm is not alpha/beta-CROWN, the strategy will revert to FSB.
+        Split using dual information from the bounding step.
+        dtype = 'UPB':
+            use the contribution of the Upper Planet Bias (UPB) on the alpha-beta-CROWN objective, fallback to FSB
+        dtype = 'SUPC':
+            use the lagrangian multipliers of the upper ReLU constraint scaled by the Planet area, fallback to the area
         '''
         parent_net = kwargs["parent_net"]
         parent_init = kwargs["parent_init"]
 
         # Use current output bounding network to retrieve dual variables
         assert parent_net is not None and parent_init is not None, \
-            "parent_net and parent_init params are required for UPB"
+            "parent_net and parent_init params are required for UPB/SUPC"
+        assert dtype in ["UPB", "SUPC"]
 
-        if not (isinstance(parent_net, Propagation) and "-crown" in parent_net.type and
-                isinstance(parent_init, PropInit)):
+        alphabetacrown_check = (isinstance(parent_net, Propagation) and "-crown" in parent_net.type and
+                                isinstance(parent_init, PropInit))
+        as_check = (isinstance(parent_net, ExpLP) and isinstance(parent_init, BigMPInit))
+        decomposition_check = (isinstance(parent_net, SaddleLP) and isinstance(parent_init, DecompositionPInit))
+        if not ((alphabetacrown_check and dtype == "UPB") or
+                ((alphabetacrown_check or as_check or decomposition_check) and dtype == "SUPC")):
             # parent_net must be using alpha/beta-CROWN to use UPB: this is the only dual for which it's designed
-            return self.branch_fsb(domains, lower_bounds, upper_bounds)
+            raise NotImplementedError("UPB only implemented for alpha/beta-CROWN. SUPC only implemented for "
+                                      "alpha/beta-CROWN, AS, Decomposition-based algorithms.")
 
         # Pass dual initialization to parent_net to retrieve the dual vars for the parent nodes
-        parent_net.initialize_from(parent_init.get_presplit_parents())
-        # Compute lambda and mu dual variables (the initialization only contains alpha/beta)
-        parent_net.build_model_using_bounds(domains, (lower_bounds, upper_bounds))
-        crown_vars = parent_net.get_closedform_lastlayer_lb_duals()
+        if alphabetacrown_check:
+            parent_net.initialize_from(parent_init.get_presplit_parents())
+            # Compute lambda and mu dual variables (the initialization only contains alpha/beta)
+            parent_net.build_model_using_bounds(domains, (lower_bounds, upper_bounds))
+            crown_vars = parent_net.get_closedform_lastlayer_lb_duals()
+        elif as_check:
+            parent_net.initialize_from(parent_init.get_presplit_parents())
+            parent_net.build_model_using_bounds(domains, (lower_bounds, upper_bounds))
+            dual_vars = parent_net.external_init.duals
+        elif decomposition_check:
+            parent_net.initialize_from(parent_init.get_presplit_parents())
+            parent_net.build_model_using_bounds(domains, (lower_bounds, upper_bounds))
+            rhos = parent_net.decomposition.external_init.rhos
 
         # Compute the intercept scores from BaBSR/FSB, yet on the parent solution of the alpha-beta CROWN dual
         # The following computations rely on the unconditioned bias for the first layer (see SR scores)
         scores = []
+        backup_scores = []
         batch_size = lower_bounds[0].shape[0]
         for lay, (clbs, cubs) in enumerate(zip(lower_bounds, upper_bounds)):
             if lay > 0 and lay < len(lower_bounds) - 1:
-                cmask = ((cubs > 0) & (clbs < 0)).unsqueeze(1)
-                bias = - ((clbs * cubs) / (cubs - clbs)).unsqueeze(1).masked_fill_(~cmask, 0)
-                beta_acs_score = bias * crown_vars.lambdas[lay - 1].clamp(0, None)
-                scores.append(beta_acs_score.reshape((batch_size, -1)))
 
-        # Select the neurons associated to the best scores for each batch entry.
-        max_info = [torch.max(cscore, dim=-1) for cscore in scores]
-        max_indices = torch.stack([cmaxinfo[1] for cmaxinfo in max_info], dim=0)
-        max_value = torch.stack([cmaxinfo[0] for cmaxinfo in max_info], dim=0)
-        max_score, layer_ind = torch.max(max_value, dim=0)
-        neuron_indices = max_indices.gather(0, layer_ind.unsqueeze(0)).squeeze(0).tolist()
-        decision_list = list(zip(layer_ind.tolist(), neuron_indices))
+                clbs = clbs.unsqueeze(1)
+                cubs = cubs.unsqueeze(1)
+                cmask = ((cubs > 0) & (clbs < 0))
+
+                if dtype == "UPB":
+                    bias = - ((clbs * cubs) / (cubs - clbs)).masked_fill_(~cmask, 0)
+                    score = bias * crown_vars.lambdas[lay - 1].clamp(0, None)
+                else:
+                    # dtype == "SUPC"
+                    planet_area = (((-clbs) * cubs) / 2).masked_fill_(~cmask, 0)
+
+                    if alphabetacrown_check:
+                        score = planet_area * crown_vars.lambdas[lay - 1].clamp(0, None)
+                    elif as_check:
+                        score = planet_area * (dual_vars.beta_0[lay] + dual_vars.beta_1[lay])
+                    else:
+                        # decomposition_check
+                        score = (planet_area * rhos[lay - 1].clamp(0, None)
+                                 / (cubs / (cubs - clbs))).masked_fill_(~cmask, 0)
+
+                    backup_scores.append(planet_area.reshape((batch_size, -1)))
+                scores.append(score.reshape((batch_size, -1)))
+
+        decision_list, max_score = decision_list_from_scores(scores)
 
         # Use FSB as fallback strategy when scores are low or a split would be performed on the first layer.
-        condition = (max_score <= self.upb_fallback_thr)
+        condition = (max_score <= self.dbi_fallback_thr)
         if condition.any():
-            fsb_decisions = self.branch_fsb(domains, lower_bounds, upper_bounds)
+
+            if dtype == "UPB":
+                backup_decisions = self.branch_fsb(domains, lower_bounds, upper_bounds)
+            else:
+                backup_decisions, _ = decision_list_from_scores(backup_scores)
+
             to_switch = condition.nonzero()
             for batch_idx in to_switch:
-                decision_list[batch_idx] = fsb_decisions[batch_idx]
+                decision_list[batch_idx] = backup_decisions[batch_idx]
             print(f"Using fallback branching for {len(to_switch)} decisions")
 
         parent_net.unbuild()
@@ -407,3 +451,14 @@ class BranchingChoice:
             else:
                 # passing ReLU obtained by setting the pre-activation LB to 0
                 domains.select(-1, 0).view(splitted_lbs_stacks[0].shape[0], -1)[batch_idx, decision[1]] = half_point
+
+
+def decision_list_from_scores(scores):
+    # Select the neurons associated to the best scores for each batch entry. Returns the max_score as auxiliary info.
+    max_info = [torch.max(cscore, dim=-1) for cscore in scores]
+    max_indices = torch.stack([cmaxinfo[1] for cmaxinfo in max_info], dim=0)
+    max_value = torch.stack([cmaxinfo[0] for cmaxinfo in max_info], dim=0)
+    max_score, layer_ind = torch.max(max_value, dim=0)
+    neuron_indices = max_indices.gather(0, layer_ind.unsqueeze(0)).squeeze(0).tolist()
+    decision_list = list(zip(layer_ind.tolist(), neuron_indices))
+    return decision_list, max_score

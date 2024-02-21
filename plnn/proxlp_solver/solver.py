@@ -821,3 +821,10 @@ class DecompositionPInit(ParentInit):
             self.rhos[x_idx-1].view(*self.rhos[x_idx-1].shape[:2], -1)
         lb_index = 0 if scores.shape[1] == 1 else 1
         return scores[:, lb_index]
+
+    def get_presplit_parents(self):
+        # Before bounding, the parent init class contains two copies of each initializer (one per BaB children).
+        # Return only one of them.
+        def halve(xlist):
+            return [x.view((x.shape[0]//2, 2, *x.shape[1:])).select(1, 0) for x in xlist]
+        return DecompositionPInit(halve(self.rhos))

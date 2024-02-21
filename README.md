@@ -2,7 +2,7 @@
 
 This repository contains PyTorch code for state-of-the-art GPU-accelerated neural network verification based on 
 Branch and Bound (BaB), developed by the [OVAL](https://www.robots.ox.ac.uk/~oval/) research group at the University of Oxford. 
-See the "publications" section below for references. 
+See the "publications" section below for references.
 
 Complete neural network verification can be cast as a non-convex global minimization problem, which can be solved via BaB.
 BaB operates by computing lower and upper bounds to the global minimum, which can be iteratively tightened by dividing the feasible domain into subproblems.
@@ -69,6 +69,8 @@ Additionally, learning-based algorithms for branching and upper bounding (not in
 - ["Neural Network Branching for Neural Network Verification"](https://arxiv.org/abs/1912.01329);
 - ["Generating Adversarial Examples with Graph Neural Networks"](https://arxiv.org/abs/2105.14644).
 
+Code to aid towards the replication of the findings described in ["Scaling the Convex Barrier with Sparse Dual Algorithms"](https://arxiv.org/abs/2101.05844) is provided in folder `scripts_jmlr`.
+Note, however, that these were based on an earlier version of the codebase.
   
 ## Running the code
 
@@ -93,7 +95,7 @@ As an example, execute the following command:
 python tools/local_robustness_from_onnx.py --network_filename ./models/onnx/cifar_base_kw.onnx
 ```
 
-*Details on how to produce a .json configuration file (see `./bab_configs/`) for the OVAL framework will be soon added to the repository*
+Some details on how to produce a .json configuration file (see `./bab_configs/`) for the OVAL framework can be found at `json_instructions.md`.
 
 ### Incomplete verification
 
@@ -124,21 +126,22 @@ In addition, code to run the framework on the OVAL and COLT datasets from VNNCOM
 The network to be verified/bounded (either via `.onnx` parsing or directly from a list of `torch` layers) must have the following form, 
 where optional layers are enclosed in brackets:
 
-    ["pre-layer transforms"] (this includes additions, multiplications --this covers normalization--, reshapings, flattenings, etc) -> 
-    linear (nn.Linear or nn.Conv2d) -> ReLU() -> ["pre-layer transforms"] -> linear -> ReLU() -> ["pre-layer transforms"] -> [linear]
+    input -> [additions/positive-multiplications/reshapings/flattenings] -> 
+    linear (nn.Linear or nn.Conv2d) -> [additions/multiplications/reshapings/flattenings] -> ReLU() -> 
+    [reshapings/flattenings] -> linear -> [additions/multiplications/reshapings/flattenings] -> ReLU() -> 
+    [reshapings/flattenings] -> [linear] -> [additions/multiplications/reshapings/flattenings]
   
 ## Installation
-The code was implemented assuming to be run under `python3.6`.
+The code was implemented assuming to be run under `python3.7`.
 We assume the user's Python environment is based on Anaconda.
 
-Installation steps (see also `vnncomp_scripts/install_tool.sh`):
 ```bash
 git clone --recursive https://github.com/oval-group/oval-bab.git
 
 cd oval-bab
 
 # Create a conda environment
-conda create -y -n oval python=3.6
+conda create -y -n oval python=3.7
 conda activate oval
 
 # Install pytorch to this virtualenv
@@ -163,4 +166,4 @@ conda config --add channels http://conda.anaconda.org/gurobi
 pip install .
 # might need
 # conda install gurobi
-```  
+```

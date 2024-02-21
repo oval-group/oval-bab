@@ -7,7 +7,8 @@ from plnn.network_linear_approximation import LinearizedNetwork
 from plnn.proxlp_solver.utils import BatchLinearOp, BatchConvOp, get_relu_mask, compute_output_padding, \
     create_final_coeffs_slice, LinearOp, ConvOp, prod, apply_transforms, CompositeLinearOp, \
     override_numerical_bound_errors
-from tools.custom_torch_modules import supported_transforms, shape_transforms, math_transforms
+from tools.custom_torch_modules import shape_transforms, build_unified_math_transforms, \
+    parse_post_linear_math_transform, supported_transforms, Mul, math_transforms
 
 
 class DualBounding(LinearizedNetwork):
@@ -113,7 +114,7 @@ class DualBounding(LinearizedNetwork):
         return obj_layer, to_skip_count
 
     def compute_lower_bound(self, node=(-1, None), upper_bound=False, counterexample_verification=False,
-                            override_numerical_errors=False):
+                            override_numerical_errors=False, full_batch_asymmetric=False):
         '''
         Compute a lower bound of the function for the given node
 
@@ -123,6 +124,7 @@ class DualBounding(LinearizedNetwork):
               For the second index, None is a special value that indicates to optimize all of them,
               both upper and lower bounds.
         upper_bound: (optional) Compute an upper bound instead of a lower bound
+        full_batch_asymmetric: if True when node[1] is None, only compute lower (or upper, if upper_bound=True) bounds
         '''
         additional_coeffs = {}
         current_lbs = self.lower_bounds[node[0]].clone()
@@ -145,7 +147,10 @@ class DualBounding(LinearizedNetwork):
         # if the resulting batch size from parallelizing over the output neurons boundings is too large, we need
         # to divide into sub-batches
         if is_full_batch:
-            neuron_batch_size = nb_out * 2
+            if full_batch_asymmetric:
+                neuron_batch_size = nb_out
+            else:
+                neuron_batch_size = nb_out * 2
         else:
             if is_part_batch:
                 if type(node[1]) is list:
@@ -170,7 +175,7 @@ class DualBounding(LinearizedNetwork):
 
             slice_coeffs = create_final_coeffs_slice(
                 start_batch_index, end_batch_index, batch_size, nb_out, current_lbs, node_layer_shape, node,
-                upper_bound=upper_bound)
+                upper_bound=upper_bound, full_batch_asymmetric=full_batch_asymmetric)
             additional_coeffs[lay_to_opt] = slice_coeffs
 
             c_bound = self.optimize(self.weights, additional_coeffs, self.lower_bounds, self.upper_bounds)
@@ -180,28 +185,34 @@ class DualBounding(LinearizedNetwork):
 
         self.opt_time_per_layer.append(end_opt_time - start_opt_time)
         if is_full_batch:
-            # Return lbs, ubs for all neurons of the given layer.
-            opted_ubs = -bound[:, :nb_out]
-            opted_lbs = bound[:, nb_out:]
-            ubs = opted_ubs.view(batch_size, *node_layer_shape)
-            lbs = opted_lbs.view(batch_size, *node_layer_shape)
+            if full_batch_asymmetric:
+                bound = bound.view(batch_size, *node_layer_shape)
+                if upper_bound:
+                    bound = -bound
+                return bound
+            else:
+                # Return lbs, ubs for all neurons of the given layer.
+                opted_ubs = -bound[:, :nb_out]
+                opted_lbs = bound[:, nb_out:]
+                ubs = opted_ubs.view(batch_size, *node_layer_shape)
+                lbs = opted_lbs.view(batch_size, *node_layer_shape)
 
-            # this is a bit of a hack for use in the context of standard counter-example verification problems
-            if counterexample_verification:
-                # if the bounds are not actual lower/upper bounds, then the subdomain for counter-example verification
-                # is infeasible
-                if lay_to_opt == len(self.weights):
-                    # signal infeasible domains with infinity at the last layer bounds
-                    lbs = torch.where(lbs > ubs, float('inf') * torch.ones_like(lbs), lbs)
-                    ubs = torch.where(lbs > ubs, float('inf') * torch.ones_like(ubs), ubs)
-                # otherwise, ignore the problem: it will be caught by the last layer
-                if override_numerical_errors:
-                    lbs, ubs = override_numerical_bound_errors(lbs, ubs)
+                # this is a bit of a hack for use in the context of standard counter-example verification problems
+                if counterexample_verification:
+                    # if the bounds are not actual lower/upper bounds, then the subdomain for counter-example verification
+                    # is infeasible
+                    if lay_to_opt == len(self.weights):
+                        # signal infeasible domains with infinity at the last layer bounds
+                        lbs = torch.where(lbs > ubs, float('inf') * torch.ones_like(lbs), lbs)
+                        ubs = torch.where(lbs > ubs, float('inf') * torch.ones_like(ubs), ubs)
+                    # otherwise, ignore the problem: it will be caught by the last layer
+                    if override_numerical_errors:
+                        lbs, ubs = override_numerical_bound_errors(lbs, ubs)
+                    return lbs, ubs
+
+                assert (ubs - lbs).min() >= 0, "Incompatible bounds"
+
                 return lbs, ubs
-
-            assert (ubs - lbs).min() >= 0, "Incompatible bounds"
-
-            return lbs, ubs
         elif is_part_batch:
             # Return lbs, ubs for all neurons of the given layer: for neurons outside the node[1] list,
             # previous intermediate bounds are returned
@@ -223,7 +234,7 @@ class DualBounding(LinearizedNetwork):
                 bound = -bound
             return bound
 
-    def define_linear_approximation(self, input_domain, no_conv=False, override_numerical_errors=False):
+    def define_linear_approximation(self, input_domain, no_conv=False, override_numerical_errors=False, cdebug=False):
         '''
         no_conv is an option to operate only on linear layers, by transforming all
         the convolutional layers into equivalent linear layers.
@@ -252,6 +263,12 @@ class DualBounding(LinearizedNetwork):
                      apply_transforms(pre_linear_transform, input_domain.select(-1, 1), no_fold=True)], dim=-1)
                 l_0 = self.input_domain.select(-1, 0)
                 u_0 = self.input_domain.select(-1, 1)
+
+                # check if math operations trail this layer
+                post_linear_math_transform, to_skip = build_unified_math_transforms(self.layers[lay_idx+1:], to_skip)
+                if post_linear_math_transform is not None:
+                    layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
+
                 l_1, u_1, cond_first_linear = self.build_first_conditioned_layer(l_0, u_0, layer, no_conv)
 
                 if override_numerical_errors:
@@ -272,22 +289,29 @@ class DualBounding(LinearizedNetwork):
                 first_linear_done = True
                 pre_linear_transform = None
 
-            elif isinstance(layer, (nn.Conv2d, nn.Linear)) or isinstance(layer, (nn.AvgPool2d, nn.ConstantPad2d)) or \
-                    isinstance(layer, math_transforms) and first_linear_done:
+            elif isinstance(layer, (nn.Conv2d, nn.Linear)) or isinstance(layer, (nn.AvgPool2d, nn.ConstantPad2d)):
                 assert next_is_linear
                 next_is_linear = False
 
-                # Create CompositeLinearOp with linear pooling operators and the following linear op
-                obj_layer, to_skip = self.build_compositelinearop(
-                    self.layers[lay_idx:], self.lower_bounds[-1].unsqueeze(1), to_skip, no_conv=no_conv,
-                    pre_transform=pre_linear_transform)
+                if self.iscomposite(self.layers[lay_idx:]):
+                    # Create CompositeLinearOp with linear pooling operators and the following linear op
+                    clayers = [self.layers[lay_idx]] + self.layers[lay_idx + to_skip + 1:]
+                    obj_layer, to_skip = self.build_compositelinearop(
+                        clayers, self.lower_bounds[-1].unsqueeze(1), to_skip, no_conv=no_conv,
+                        pre_transform=pre_linear_transform)
 
-                if len(obj_layer.operators) == 1 and isinstance(obj_layer.operators[0], (nn.Conv2d, nn.Linear)):
-                    # Simplify the operator for lin and conv layers.
+                else:
+                    # check if math operations trail this layer
+                    post_linear_math_transform, to_skip = build_unified_math_transforms(
+                        self.layers[lay_idx+1:], to_skip)
+                    if post_linear_math_transform is not None:
+                        layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
+
                     orig_shape_prev_ub = self.original_shape_ubs[-1] if no_conv else None
                     obj_layer, obj_layer_orig = self.build_obj_layer(self.upper_bounds[-1], layer, no_conv,
                                                                      orig_shape_prev_ub=orig_shape_prev_ub,
                                                                      pre_transform=pre_linear_transform)
+
                 weights.append(obj_layer)
                 layer_opt_start_time = time.time()
                 l_kp1, u_kp1 = self.solve_problem(weights, self.lower_bounds, self.upper_bounds,
@@ -319,6 +343,9 @@ class DualBounding(LinearizedNetwork):
                 next_is_linear = True
             elif isinstance(layer, shape_transforms) or \
                     (not first_linear_done and isinstance(layer, supported_transforms)):
+                if isinstance(layer, Mul):
+                    # negative multiplications would need a more careful handling of the input bounds
+                    assert (layer.const >= 0).all()
                 if pre_linear_transform is None:
                     pre_linear_transform = [layer]
                 else:
@@ -327,7 +354,10 @@ class DualBounding(LinearizedNetwork):
                 raise NotImplementedError
         self.weights = weights
 
-    def build_model_using_bounds(self, domain, intermediate_bounds, build_limit=None, no_conv=False):
+        if cdebug:
+            self._debug_forward()
+
+    def build_model_using_bounds(self, domain, intermediate_bounds, build_limit=None, no_conv=False, cdebug=False):
         """
         Build the model from the provided intermediate bounds.
         If no_conv is true, convolutional layers are treated as their equivalent linear layers. In that case,
@@ -341,10 +371,13 @@ class DualBounding(LinearizedNetwork):
         first_layer = 0
         pre_linear_transform = None
         for idx, clayer in enumerate(self.layers):
-            if isinstance(clayer, nn.Conv2d) or isinstance(clayer, nn.Linear):
+            if isinstance(clayer, (nn.Linear, nn.Conv2d)):
                 first_layer = idx
                 break
             elif isinstance(clayer, supported_transforms):
+                if isinstance(clayer, Mul):
+                    # negative multiplications would need a more careful handling of the input bounds
+                    assert (clayer.const >= 0).all()
                 if pre_linear_transform is None:
                     pre_linear_transform = [clayer]
                 else:
@@ -358,8 +391,14 @@ class DualBounding(LinearizedNetwork):
         l_0 = self.input_domain.select(-1, 0)
         u_0 = self.input_domain.select(-1, 1)
 
+        layer = self.layers[first_layer]
+        # check if math operations trail this layer
+        plmt, n_post_first_math = build_unified_math_transforms(self.layers[first_layer+1:], 0)
+        if plmt is not None:
+            layer = parse_post_linear_math_transform(layer, *plmt)
+
         _, _, cond_first_linear = self.build_first_conditioned_layer(
-            l_0, u_0, self.layers[first_layer], no_conv=no_conv)
+            l_0, u_0, layer, no_conv=no_conv)
         # Add the first layer, appropriately rescaled.
         self.weights = [cond_first_linear]
         # Change the lower bounds and upper bounds corresponding to the inputs
@@ -383,27 +422,35 @@ class DualBounding(LinearizedNetwork):
         lay_idx = 1
         pre_linear_transform = None
         to_skip = 0
-        for cidx, layer in enumerate(self.layers[first_layer+1:]):
+        start_idx = first_layer+1+n_post_first_math
+        for cidx, layer in enumerate(self.layers[start_idx:]):
             if build_limit is not None and lay_idx >= build_limit:
                 break
             if to_skip > 0:
                 to_skip -= 1
                 continue
-            if isinstance(layer, (nn.Conv2d, nn.Linear)) or isinstance(layer, (nn.AvgPool2d, nn.ConstantPad2d)) or \
-                    isinstance(layer, math_transforms):
+            if isinstance(layer, (nn.Conv2d, nn.Linear)) or isinstance(layer, (nn.AvgPool2d, nn.ConstantPad2d)):
                 assert next_is_linear
                 next_is_linear = False
                 orig_shape_prev_ub = self.original_shape_ubs[lay_idx] if no_conv else None
 
-                # Create CompositeLinearOp with linear pooling operators and the following linear op
-                new_layer, to_skip = self.build_compositelinearop(
-                    self.layers[first_layer+1+cidx:], self.lower_bounds[lay_idx].unsqueeze(1), to_skip,
-                    no_conv=no_conv, pre_transform=pre_linear_transform)
-                if len(new_layer.operators) == 1 and isinstance(new_layer.operators[0], (nn.Conv2d, nn.Linear)):
-                    # Simplify the operator for lin and conv layers.
+                if self.iscomposite(self.layers[first_layer+1+cidx:]):
+                    # Create CompositeLinearOp with linear pooling operators and the following linear op
+                    clayers = [self.layers[start_idx + cidx]] + self.layers[start_idx + cidx + to_skip + 1:]
+                    new_layer, to_skip = self.build_compositelinearop(
+                        clayers, self.lower_bounds[lay_idx].unsqueeze(1), to_skip,
+                        no_conv=no_conv, pre_transform=pre_linear_transform)
+                else:
+                    # check if math operations trail this layer
+                    post_linear_math_transform, to_skip = build_unified_math_transforms(
+                        self.layers[start_idx + cidx + 1:], to_skip)
+                    if post_linear_math_transform is not None:
+                        layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
+
                     new_layer, _ = self.build_obj_layer(
                         self.upper_bounds[lay_idx], layer, no_conv=no_conv, orig_shape_prev_ub=orig_shape_prev_ub,
                         pre_transform=pre_linear_transform)
+
                 self.weights.append(new_layer)
                 lay_idx += 1
                 pre_linear_transform = None
@@ -417,6 +464,9 @@ class DualBounding(LinearizedNetwork):
                     pre_linear_transform.append(layer)
             else:
                 raise NotImplementedError
+
+        if cdebug and build_limit is None:
+            self._debug_forward()
 
     def solve_problem(self, weights, lower_bounds, upper_bounds, override_numerical_errors=False):
         '''
@@ -486,3 +536,43 @@ class DualBounding(LinearizedNetwork):
     def decrease_iters(self):
         # Decrease the number of iterations of the algorithm this class represents.
         self.set_iters(max(self.steps - self.step_increase, self.min_steps))
+
+    @staticmethod
+    def iscomposite(layers):
+        # returns True if the series of layers will be cast as a CompositeLinearOp
+        count = 0
+        for clayer in layers:
+            if isinstance(clayer, nn.ReLU):
+                break
+            if isinstance(clayer, (nn.Conv2d, nn.Linear)) or isinstance(clayer, (nn.AvgPool2d, nn.ConstantPad2d)):
+                count += 1
+            if isinstance(clayer, math_transforms) and clayer.const.numel() != clayer.const.shape[0]:
+                # math operations that are not scalar-valued, or with one constant per output channel, are handled as
+                # composite operators
+                count += 1
+        return count > 1
+
+    def _debug_forward(self, numerical_tolerance=1e-3):
+        # check whether the forward pass of the converted model complies with the original model
+        l_0 = apply_transforms(self.input_transforms, self.input_domain.select(-1, 0), no_fold=True, inverse=True)
+        u_0 = apply_transforms(self.input_transforms, self.input_domain.select(-1, 1), no_fold=True, inverse=True)
+
+        # forward pass with the converted model, used for verification
+        def converted_forward(x):
+            c_l = self.input_domain.select(-1, 0).unsqueeze(1)
+            c_u = self.input_domain.select(-1, 1).unsqueeze(1)
+            x = apply_transforms(self.input_transforms, x, no_fold=True).unsqueeze(1)
+            x = (x - .5 * (c_u + c_l)) / (.5 * (c_u - c_l))
+            for clayer in self.weights[:-1]:
+                x = clayer.forward(x)
+                x = torch.nn.ReLU()(x)
+            return self.weights[-1].forward(x).squeeze(1)
+
+        # sample uniformly in input domain
+        inp_ex = (torch.zeros_like(l_0).uniform_() * (u_0 - l_0) + l_0)
+
+        # check whether the forward passes are equivalent
+        out = self.net(inp_ex)
+        out_converted = converted_forward(inp_ex)
+
+        assert (out - out_converted).abs().max() < numerical_tolerance

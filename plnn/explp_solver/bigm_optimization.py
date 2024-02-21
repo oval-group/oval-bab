@@ -640,3 +640,15 @@ class BigMPInit(anderson_optimization.AndersonPInit):
         for varset in constructor_vars:
             stacked_dual_list.append([c_init[:, -1].unsqueeze(1) for c_init in varset])
         return BigMPInit(DualVars(*stacked_dual_list))
+
+    def get_presplit_parents(self):
+        # Before bounding, the parent init class contains two copies of each initializer (one per BaB children).
+        # Return only one of them.
+        def halve(xlist):
+            return [x.view((x.shape[0]//2, 2, *x.shape[1:])).select(1, 0) for x in xlist]
+        halved_dual_list = []
+        constructor_vars = [self.duals.alpha, self.duals.beta_0, self.duals.beta_1, self.duals.fs,
+                            self.duals.gs, self.duals.alpha_back, self.duals.beta_1_back]
+        for varset in constructor_vars:
+            halved_dual_list.append(halve(varset))
+        return BigMPInit(DualVars(*halved_dual_list))

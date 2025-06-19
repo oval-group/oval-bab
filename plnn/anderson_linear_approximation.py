@@ -1,6 +1,7 @@
 from plnn.network_linear_approximation import LinearizedNetwork
-from tools.custom_torch_modules import View, Flatten, Add, Mul, Reshape
-from plnn.proxlp_solver.utils import prod, OptimizationTrace
+from tools.custom_torch_modules import supported_transforms, shape_transforms, build_unified_math_transforms, \
+    parse_post_linear_math_transform, math_transforms, Add
+from plnn.proxlp_solver.utils import prod, OptimizationTrace, apply_transforms
 from plnn.branch_and_bound.utils import ParentInit
 from plnn.proxlp_solver.solver import SaddleLP
 
@@ -63,6 +64,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         self.gurobi_z_vars = []
         self.ambiguous_relus = []  # Keep track of which ReLUs are ambiguous.
         self.neurons_per_layer = neurons_per_layer
+        self.pending_lower_bound = False
+        self.lb_input = None
 
         # Keep track of which Gurobi constraints have been added from the exponential family [only for "lp-cut"]
         self.added_exp_constraints = []
@@ -88,20 +91,14 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             if layer_idx == 0:
                 continue
 
-            if type(layer) not in [nn.Conv2d, nn.Linear, nn.ReLU, Flatten, View, Add, Mul, Reshape]:
+            if type(layer) not in [nn.Conv2d, nn.Linear, nn.ReLU, *supported_transforms]:
                 raise ValueError("{} does not support layer type {}".format(type(self), type(layer)))
 
             previous_layer = self.layers[layer_idx-1]
-            if type(layer) is nn.ReLU:
-                if type(previous_layer) not in [nn.Conv2d, nn.Linear]:
-                    raise ValueError("{} expects Linear or Conv2d before ReLU",format(type(self)))
             if type(layer) in [nn.Linear, nn.Conv2d]:
                 if type(previous_layer) in [nn.Linear, nn.Conv2d]:
                     raise ValueError("{} doesn't support consecutive linear layers. Please " +
                                      "merge them into one".format(type(self)))
-
-            if (layer is self.layers[-1]) and type(layer) not in [nn.Linear, nn.Conv2d]:
-                raise ValueError("Last layer is neither linear nor convolutional.")
 
             if type(layer) is nn.Conv2d:
                 assert layer.dilation == (1, 1)  # inherited from Rudy
@@ -126,7 +123,6 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         :param intermediate_bounds: (lower_bounds, upper_bounds) each as list of tensors (of size equal to the number
         of ReLU layers, + 1, the input bounds). IMPORTANT: these describe post-activation bounds.
         """
-        self.device = input_domain[0].device
         lbs, ubs = intermediate_bounds
         self.lower_bounds = []
         self.upper_bounds = []
@@ -190,23 +186,30 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         if not self.lower_bounds:
             raise ValueError("compute_lower_bound called without any bounds stored.")
 
-        device = self.input_domain.device
         # this piece of code assumes that the batch dimension is not there
-        self.lower_bounds = [lbs.to(device).squeeze(0) for lbs in self.lower_bounds]
-        self.upper_bounds = [ubs.to(device).squeeze(0) for ubs in self.upper_bounds]
+        self.lower_bounds = [lbs.to(self.device).squeeze(0) for lbs in self.lower_bounds]
+        self.upper_bounds = [ubs.to(self.device).squeeze(0) for ubs in self.upper_bounds]
 
         # retrieve correct relu and layer indices
         x_idx = len(self.lower_bounds) + node[0] if node[0] < 0 else node[0]
+        pre_linear_transform = None
         id_count = 1
         for lay_idx, layer in enumerate(self.layers):
-            if id_count == x_idx and type(layer) is not Flatten:
+            if id_count == x_idx and not isinstance(layer, shape_transforms):
                 break
+            if isinstance(layer, (nn.Linear, nn.Conv2d)) and pre_linear_transform is not None:
+                pre_linear_transform = None
             if type(layer) is nn.ReLU:
                 id_count += 1
+            elif isinstance(layer, shape_transforms):
+                if pre_linear_transform is None:
+                    pre_linear_transform = [layer]
+                else:
+                    pre_linear_transform.append(layer)
         layer_idx = lay_idx
 
         # Retrieve lower, upper bounds, and variables of previous layer.
-        l_km1, u_km1, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx)
+        _, _, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx, pre_linear_transform)
 
         is_batch = (node[1] is None)
         if not is_batch:
@@ -216,10 +219,10 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 counterexample_verification=counterexample_verification, single_neuron=(node[1], upper_bound))
 
             # the rest of the code assumes the batch dimension is there
-            self.lower_bounds = [lbs.to(device).unsqueeze(0) for lbs in self.lower_bounds]
-            self.upper_bounds = [ubs.to(device).unsqueeze(0) for ubs in self.upper_bounds]
+            self.lower_bounds = [lbs.to(self.device).unsqueeze(0) for lbs in self.lower_bounds]
+            self.upper_bounds = [ubs.to(self.device).unsqueeze(0) for ubs in self.upper_bounds]
 
-            return torch.tensor(c_b, device=device).unsqueeze(0)
+            return torch.tensor(c_b, device=self.device).unsqueeze(0)
         else:
             # Batched last layer bound computation.
 
@@ -232,8 +235,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 counterexample_verification=counterexample_verification)
 
             # the rest of the code assumes the batch dimension is there
-            self.lower_bounds = [lbs.to(device).unsqueeze(0) for lbs in self.lower_bounds]
-            self.upper_bounds = [ubs.to(device).unsqueeze(0) for ubs in self.upper_bounds]
+            self.lower_bounds = [lbs.to(self.device).unsqueeze(0) for lbs in self.lower_bounds]
+            self.upper_bounds = [ubs.to(self.device).unsqueeze(0) for ubs in self.upper_bounds]
 
             return preact_lower.unsqueeze(0), preact_upper.unsqueeze(0)
 
@@ -245,7 +248,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
 
         self.global_lb_upper_bound = float("inf")
 
-        if self.lower_bounds[-1].item() > 0:
+        if self.lower_bounds[-1].item() > self.decision_boundary:
             print("Early stopping")
             return (False, None, 0)
         if timeout is not None:
@@ -260,7 +263,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
 
         elif self.model.status is grb.GRB.OPTIMAL:
             # There is a feasible solution.
-            return (global_lb < 0, global_lb, nb_visited_states)
+            return (global_lb < self.decision_boundary, global_lb, nb_visited_states)
 
         elif self.model.status is grb.GRB.INTERRUPTED:
             return (self.interrupted_sat, None, nb_visited_states)
@@ -334,8 +337,6 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         # Remove preprocessing before the network.
         input_domain = self.handle_net_preprocessing(input_domain)
 
-        self.input_domain = input_domain
-        device = self.input_domain.device
         ## Do the input layer, which is a special case
         inp_lbs, inp_ubs, inp_gurobi_vars = self.create_input_variables(input_domain)
         if not int_bounds_provided:
@@ -353,6 +354,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         ## Do the other layers, computing for each of the neuron, its upper
         ## bound and lower bound
         x_idx = 1
+        pre_linear_transform = None
         for layer_idx, layer in enumerate(self.layers[:-1]):
             # stop if we've reached x_idx_max
             if x_idx_max > 0 and x_idx > x_idx_max:
@@ -364,8 +366,16 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             if type(layer) is nn.ReLU:
 
                 # Retrieve lower, upper bounds, and variables of previous layer.
-                l_km1, u_km1, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx)
-                previous_layer = self.layers[layer_idx-1]
+                l_km1, u_km1, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx, pre_linear_transform)
+                previous_layer, prev_lay_idx = self.get_prev_linear_layer(layer_idx)
+
+                if isinstance(previous_layer, (nn.Linear, nn.Conv2d)):
+                    # check if math operations trail this layer
+                    post_linear_math_transform, _ = build_unified_math_transforms(
+                        self.layers[prev_lay_idx + 1:], 0)
+                    if post_linear_math_transform is not None:
+                        previous_layer = parse_post_linear_math_transform(previous_layer, *post_linear_math_transform)
+
                 if not int_bounds_provided:
                     # Compute upper and lower bounds of the linear part of the layer.
                     # start of logging time for optimization
@@ -401,7 +411,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                             pre_ub,
                             preact_vars[neuron_idx],
                             non_zero_indices_set,
-                            powerset
+                            powerset,
+                            pre_linear_transform
                         )
 
                         new_layer_gurobi_x_vars.append(x_var)
@@ -451,7 +462,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                                     pre_ub.item(),
                                     preact_vars[out_chan_idx][out_row_idx][out_col_idx],
                                     non_zero_indices_set,
-                                    powerset
+                                    powerset,
+                                    pre_linear_transform
                                 )
 
                                 out_row_x_vars.append(x_var)
@@ -464,6 +476,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                         new_layer_gurobi_z_vars.append(out_chan_z_vars)
                         new_layer_ambiguous_relus.append(out_chan_amb_relus)
 
+                pre_linear_transform = None
                 if not int_bounds_provided:
                     self.lower_bounds.append(torch.clamp(preact_lower, 0, None))
                     self.upper_bounds.append(torch.clamp(preact_upper, 0, None))
@@ -478,10 +491,15 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 self.last_relu_index = layer_idx
                 self.model.update()
 
-            elif type(layer) == View:
-                continue
-            elif type(layer) == Flatten:
-                continue
+            elif isinstance(layer, shape_transforms):
+                if pre_linear_transform is None:
+                    pre_linear_transform = [layer]
+                else:
+                    pre_linear_transform.append(layer)
+            elif isinstance(layer, math_transforms):
+                previous_layer, _ = self.get_prev_linear_layer(layer_idx)
+                if not isinstance(previous_layer, (nn.Conv2d, nn.Linear)):
+                    raise NotImplementedError("mid-network Add and Mul must follow a linear/conv2d layer")
             elif not isinstance(layer, (nn.Conv2d, nn.Linear)):
                 raise NotImplementedError
 
@@ -490,16 +508,27 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 # start of logging time for optimization
                 if x_idx == self.store_bounds_progress:
                     self.logger.start_timing()
-                self.compute_final_layer_bounds()
+                self.compute_final_layer_bounds(pre_linear_transform)
             elif not self.model_built:
                 x_idx = len(self.lower_bounds) - 1
-                l_km1, u_km1, x_km1_vars = self.get_previous_layer_info(x_idx, len(self.layers)-1)
-                preact_vars = self.compute_pre_activation_bounds(x_idx, self.layers[-1], x_km1_vars, optimize=False)
+
+                _, last_lay_idx = self.get_prev_linear_layer(len(self.layers)-1)
+                self.last_linear_lay_idx = last_lay_idx
+                _, _, x_km1_vars = self.get_previous_layer_info(x_idx, last_lay_idx, pre_linear_transform)
+                layer = self.layers[last_lay_idx]
+
+                # check if math operations trail this layer
+                post_linear_math_transform, _ = build_unified_math_transforms(
+                    self.layers[last_lay_idx + 1:], 0)
+                if post_linear_math_transform is not None:
+                    layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
+
+                preact_vars = self.compute_pre_activation_bounds(x_idx, layer, x_km1_vars, optimize=False)
                 self.preact_x_vars.append(preact_vars)
 
         # unsqueeze the bounds to comply with batched SaddleLP
-        self.lower_bounds = [lbs.to(device).unsqueeze(0) for lbs in self.lower_bounds]
-        self.upper_bounds = [ubs.to(device).unsqueeze(0) for ubs in self.upper_bounds]
+        self.lower_bounds = [lbs.to(self.device).unsqueeze(0) for lbs in self.lower_bounds]
+        self.upper_bounds = [ubs.to(self.device).unsqueeze(0) for ubs in self.upper_bounds]
 
         self.model.update()
 
@@ -513,7 +542,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         c_preact_upper,
         c_preact_var,
         non_zero_indices_set,
-        powerset
+        powerset,
+        pre_linear_transform
     ):
         """
         Add all the variables and constraints corresponding to the composition of a linear function and a ReLU according
@@ -607,14 +637,15 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                     else:
                         negative_list = non_zero_indices_set - set([tuple(ind_list) for ind_list in index_list])
                     tighten_expression = self.get_tighten_constraint(x_idx, layer_idx, neuron_coordinates,
-                                                                     index_list, negative_list, z_var)
+                                                                     index_list, negative_list, z_var,
+                                                                     pre_linear_transform)
                     c_beta = self.model.addConstr(x_var <= tighten_expression)
                     beta.append(c_beta)
             self.active_anderson_constraints.extend(beta)
 
         return x_var, z_var, ambiguous_relu
 
-    def compute_final_layer_bounds(self, ub_only=False):
+    def compute_final_layer_bounds(self, pre_linear_transform, ub_only=False):
         """
         Compute the bounds for the last network layer. Assumes all previous bounds have been computed (or provided)
         and stored in self.lower_bounds and self.upper_bounds.
@@ -625,14 +656,21 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             raise ValueError("compute_final_layer_bounds called without any bounds stored.")
 
         x_idx = len(self.lower_bounds) - 1
-        layer_idx = len(self.layers)-1
+
+        layer, layer_idx = self.get_prev_linear_layer(len(self.layers)-1)
+        self.last_linear_lay_idx = layer_idx
+        # check if math operations trail this layer
+        post_linear_math_transform, _ = build_unified_math_transforms(
+            self.layers[layer_idx + 1:], 0)
+        if post_linear_math_transform is not None:
+            layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
 
         # Retrieve lower, upper bounds, and variables of previous layer.
-        l_km1, u_km1, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx)
+        _, _, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx, pre_linear_transform)
 
         # If we're on the final level, compute the layer output and optimize over it.
-        preact_lower, preact_upper, preact_vars = self.compute_pre_activation_bounds(x_idx, self.layers[-1], x_km1_vars,
-                                                                                     ub_only=ub_only)
+        preact_lower, preact_upper, preact_vars = self.compute_pre_activation_bounds(
+            x_idx, layer, x_km1_vars, ub_only=ub_only)
 
         self.lower_bounds.append(preact_lower)
         self.upper_bounds.append(preact_upper)
@@ -1070,38 +1108,32 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
 
         return lin_expr
 
-    def get_previous_layer_info(self, x_idx, layer_idx):
+    def get_previous_layer_info(self, x_idx, layer_idx, pre_linear_transform):
         """
         Get lower bounds, upper bounds, and Gurobi variables relative to the last layer.
         :param x_idx: layer number counting hidden layers (ReLUs not counted)
         :param layer_idx: layer number as in the layer list (counts ReLUs)
         :return: last layer lower bounds (torch.tensor), upper bounds (torch.tensor), list of gurobi variables
         """
-
         c_layer = self.layers[layer_idx]
         if layer_idx == 0 and type(c_layer) is nn.ReLU:
             raise ValueError("Error: ReLU as very first layer.")
-        linear_layer = self.layers[layer_idx-1] if type(c_layer) is nn.ReLU else c_layer
+
+        if type(c_layer) is nn.ReLU:
+            linear_layer, _ = self.get_prev_linear_layer(layer_idx)
+        else:
+            linear_layer = c_layer
 
         if type(linear_layer) is nn.Linear:
-            l_km1 = self.lower_bounds[x_idx - 1]
-            u_km1 = self.upper_bounds[x_idx - 1]
-            if l_km1.dim() > 1:
-                l_km1 = l_km1.flatten()
-                u_km1 = u_km1.flatten()
-                x_km1_vars = []
-                for chan_idx in range(len(self.gurobi_x_vars[x_idx-1])):
-                    for row_idx in range(len(self.gurobi_x_vars[x_idx-1][chan_idx])):
-                        x_km1_vars.extend(self.gurobi_x_vars[x_idx-1][chan_idx][row_idx])
-            else:
-                x_km1_vars = self.gurobi_x_vars[x_idx-1]
+            l_km1 = apply_transforms(pre_linear_transform, self.lower_bounds[x_idx - 1].unsqueeze(0)).squeeze(0)
+            u_km1 = apply_transforms(pre_linear_transform, self.upper_bounds[x_idx - 1].unsqueeze(0)).squeeze(0)
         elif type(linear_layer) is nn.Conv2d:
-            l_km1 = self.lower_bounds[x_idx-1].unsqueeze(0)  # these bounds are 3d: they are images (input to conv), plus the first dimension is the batch size
-            u_km1 = self.upper_bounds[x_idx-1].unsqueeze(0)  # unsqueeze makes them 4d to add batch size (1)
-            x_km1_vars = self.gurobi_x_vars[x_idx-1]
+            l_km1 = apply_transforms(pre_linear_transform, self.lower_bounds[x_idx - 1].unsqueeze(0))
+            u_km1 = apply_transforms(pre_linear_transform, self.upper_bounds[x_idx - 1].unsqueeze(0))
         else:
-            raise ValueError(f"get_x_km1 not implemented for {type(linear_layer)} layer")
+            raise ValueError(f"get_previous_layer_info not implemented for {type(linear_layer)} layer")
 
+        x_km1_vars = self.apply_transforms_gurobivars(pre_linear_transform, self.gurobi_x_vars[x_idx-1])
         return l_km1, u_km1, x_km1_vars
 
     def insert_tighten_cut(self, model, where, first_call=False, counterexample_verification=False):
@@ -1136,26 +1168,37 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 if self.mode == "mip-exact":
                     # check if this LP solution leads to a negative UB on the global LB (terminate, in case)
                     with torch.no_grad():
-                        out = self.net(self.get_input_list()).squeeze().item()
-                        out = out
-                    if out < 0:
+                        input_assignment = self.get_input_list(callback_call=True)
+                        out = self.net(input_assignment).squeeze().item()
+                        if self.pending_lower_bound:
+                            self.lb_input = input_assignment
+                    if out < self.decision_boundary:
                         self.interrupted_sat = True  # SAT
                         model.terminate()
 
                 # Add the most violated constraint for all the ReLU neurons we already added to the model.
                 # For each layer, neurons are added in decreasing order of violation amount.
                 x_idx = 1
+                pre_linear_transform = None
                 # If the threshold has been reached already, no need to add more constraints.
                 if (self.mode == "mip-exact" and self.insert_cuts) or \
                         (self.mode == "lp-cut" and self.applied_cuts < self.cut_treshold):
                     for layer_idx in range(self.last_relu_index+1):
-                        # Nothing to cut a the last layer.
-                        if layer_idx == len(self.layers)-1:
-                            continue
+                        # Nothing to cut at the last layer.
+                        if layer_idx == self.last_linear_lay_idx:
+                            break
                         layer = self.layers[layer_idx]
 
                         if type(layer) is nn.ReLU:
-                            previous_layer = self.layers[layer_idx - 1]
+                            previous_layer, prev_lay_idx = self.get_prev_linear_layer(layer_idx)
+
+                            if isinstance(previous_layer, (nn.Linear, nn.Conv2d)):
+                                # check if math operations trail this layer
+                                post_linear_math_transform, _ = build_unified_math_transforms(
+                                    self.layers[prev_lay_idx + 1:], 0)
+                                if post_linear_math_transform is not None:
+                                    previous_layer = parse_post_linear_math_transform(
+                                        previous_layer, *post_linear_math_transform)
 
                             violation_list = []
                             if type(previous_layer) is nn.Linear:
@@ -1165,7 +1208,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                                 for neuron_idx in neuron_range:
                                     if self.ambiguous_relus[x_idx-1][neuron_idx]:
                                         is_violated, violated_set, violation = self.most_violated_tighten(
-                                            x_idx, layer_idx, neuron_idx, first_call=first_call)
+                                            x_idx, layer_idx, neuron_idx, pre_linear_transform, first_call=first_call)
                                         if is_violated:
                                             non_zero_indices = torch.nonzero(
                                                 previous_layer.weight[neuron_idx, :]).flatten().tolist()
@@ -1199,7 +1242,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                                     if self.ambiguous_relus[x_idx-1][out_chan_idx][out_row_idx][out_col_idx]:
                                         is_violated, violated_set, violation = self.most_violated_tighten(
                                             x_idx, layer_idx, (out_chan_idx, out_row_idx, out_col_idx),
-                                            first_call=first_call)
+                                            pre_linear_transform, first_call=first_call)
                                         if is_violated:
                                             violation_list.append((violated_set, violation,
                                                                    (out_chan_idx, out_row_idx, out_col_idx),
@@ -1218,7 +1261,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                                     x_var = self.gurobi_x_vars[x_idx][out_chan_idx][out_row_idx][out_col_idx]
                                 negative_list = non_zero_indices_set - set(violated_set)
                                 tighten_expression = self.get_tighten_constraint(
-                                    x_idx, layer_idx, neuron_coordinates, violated_set, negative_list, z_var)
+                                    x_idx, layer_idx, neuron_coordinates, violated_set, negative_list, z_var,
+                                    pre_linear_transform)
                                 if self.mode == "lp-cut":
                                     cbeta = model.addConstr(x_var <= tighten_expression)
                                     self.added_exp_constraints[self.c_neuron].append(cbeta)
@@ -1227,6 +1271,16 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                                     #  approach
                                     model.cbCut(x_var <= tighten_expression)
                             x_idx += 1
+                            pre_linear_transform = None
+                        elif isinstance(layer, shape_transforms):
+                            if pre_linear_transform is None:
+                                pre_linear_transform = [layer]
+                            else:
+                                pre_linear_transform.append(layer)
+                        elif isinstance(layer, math_transforms):
+                            previous_layer, _ = self.get_prev_linear_layer(layer_idx)
+                            if not isinstance(previous_layer, (nn.Conv2d, nn.Linear)):
+                                raise NotImplementedError("mid-network Add and Mul must follow a linear/conv2d layer")
 
                 self.applied_cuts += 1
 
@@ -1255,22 +1309,29 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             if where == grb.GRB.Callback.MIP:
                 best_bound = model.cbGet(grb.GRB.Callback.MIP_OBJBND)
                 self.global_lb_upper_bound = best_bound
-                if best_bound > 0:
+                if best_bound > self.decision_boundary:
                     self.interrupted_sat = False  # UNSAT
                     model.terminate()
 
             if where == grb.GRB.Callback.MIPSOL:
                 obj = model.cbGet(grb.GRB.Callback.MIPSOL_OBJ)
-                if obj < 0:
+                if obj < self.decision_boundary:
                     # Does it have a chance at being a valid
                     # counter-example?
 
                     # Check it with the network
-                    input_vals = model.cbGetSolution(self.preact_x_vars[0])
+                    inp_var_list = self.preact_x_vars[0]
+                    if isinstance(inp_var_list[0], list):
+                        # flatten the input variables if necessary for the gurobi function to work
+                        inp_var_list = []
+                        for chan_idx in range(len(self.preact_x_vars[0])):
+                            for row_idx in range(len(self.preact_x_vars[0][chan_idx])):
+                                inp_var_list.extend(self.preact_x_vars[0][chan_idx][row_idx])
+                    input_vals = model.cbGetSolution(inp_var_list)
 
                     with torch.no_grad():
                         if isinstance(input_vals, list):
-                            inps = torch.Tensor(input_vals).view(1, -1)
+                            inps = torch.Tensor(input_vals).view((1,) + self.lower_bounds[0].shape)
                         else:
                             assert isinstance(input_vals, grb.tupledict)
                             inps = torch.Tensor([val for val in input_vals.values()])
@@ -1278,11 +1339,14 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                         out = self.net(inps).squeeze()
                         out = out.item()
 
-                    if out < 0:
+                        if self.pending_lower_bound:
+                            self.lb_input = inps
+
+                    if out < self.decision_boundary:
                         self.interrupted_sat = True  # SAT
                         model.terminate()
 
-    def most_violated_tighten(self, x_idx, layer_idx, neuron_coordinates, first_call=False):
+    def most_violated_tighten(self, x_idx, layer_idx, neuron_coordinates, pre_linear_transform, first_call=False):
         """
         Compute the most violated constraint from the exponential family of [1] for the neuron specified by
         neuron_coordinates. Designed to be called from within the gurobi callback "insert_tighten_cut"
@@ -1294,9 +1358,18 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         violated tighten constraint.
         """
 
-        layer = self.layers[layer_idx-1]
+        layer, lay_idx = self.get_prev_linear_layer(layer_idx-1)
+
+        if isinstance(layer, (nn.Linear, nn.Conv2d)):
+            # check if math operations trail this layer
+            post_linear_math_transform, _ = build_unified_math_transforms(
+                self.layers[lay_idx + 1:], 0)
+            if post_linear_math_transform is not None:
+                layer = parse_post_linear_math_transform(
+                    layer, *post_linear_math_transform)
+
         # Retrieve lower, upper bounds, and variables of previous layer.
-        l_km1, u_km1, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx)
+        l_km1, u_km1, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx, pre_linear_transform)
 
         if type(layer) is nn.Linear:
 
@@ -1438,7 +1511,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
 
         return is_violated, most_violated_indices, y_value - constraint_value
 
-    def get_tighten_constraint(self, x_idx, layer_idx, neuron_coordinates, index_list, negative_list, z_var):
+    def get_tighten_constraint(self, x_idx, layer_idx, neuron_coordinates, index_list, negative_list, z_var, pre_linear_transform):
         """
         Return a Gurobi linear expression for the current tighten constraint defined by index_list (and its complement
         negative_list).
@@ -1451,9 +1524,16 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         :return: Gurobi linear expression for the current tighten constraint
         """
 
-        layer = self.layers[layer_idx - 1]
+        layer, layer_idx = self.get_prev_linear_layer(layer_idx - 1)
+
+        if isinstance(layer, (nn.Linear, nn.Conv2d)):
+            # check if math operations trail this layer
+            post_linear_math_transform, _ = build_unified_math_transforms(self.layers[layer_idx + 1:], 0)
+            if post_linear_math_transform is not None:
+                layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
+
         # Retrieve lower, upper bounds, and variables of previous layer.
-        l_km1, u_km1, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx)
+        l_km1, u_km1, x_km1_vars = self.get_previous_layer_info(x_idx, layer_idx, pre_linear_transform)
         tighten_expression = 0
 
         if type(layer) is nn.Linear:
@@ -1559,26 +1639,26 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         return [torch.cat([x_solution_ub[x_idx], x_solution_lb[x_idx]], 0) for x_idx in range(len(x_solution_ub))],\
                [torch.cat([z_solution_ub[x_idx], z_solution_lb[x_idx]], 0) for x_idx in range(len(z_solution_ub))]
 
-    def get_input_list(self):
+    def get_input_list(self, callback_call=False):
         inp_size = self.lower_bounds[0].size()
         mini_inp = torch.zeros_like(self.lower_bounds[0])
 
         if len(inp_size) == 1:
             # This is a linear input.
             for i in range(inp_size[0]):
-                if self.mode != "mip-exact":
-                    mini_inp[i] = self.gurobi_x_vars[0][i].x
-                else:
+                if self.mode == "mip-exact" and callback_call:
                     mini_inp[i] = self.model.cbGetNodeRel(self.gurobi_x_vars[0][i])
+                else:
+                    mini_inp[i] = self.gurobi_x_vars[0][i].x
 
         else:
             for i in range(inp_size[0]):
                 for j in range(inp_size[1]):
                     for k in range(inp_size[2]):
-                        if self.mode != "mip-exact":
-                            mini_inp[i, j, k] = self.gurobi_x_vars[0][i][j][k].x
-                        else:
+                        if self.mode == "mip-exact" and callback_call:
                             mini_inp[i, j, k] = self.model.cbGetNodeRel(self.gurobi_x_vars[0][i][j][k])
+                        else:
+                            mini_inp[i, j, k] = self.gurobi_x_vars[0][i][j][k].x
         return mini_inp.unsqueeze(0)
 
     def compute_crown_intercept(self, x_idx):

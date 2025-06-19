@@ -27,8 +27,7 @@ gpu = True
 decision_bound = 0
 
 
-def bab(verif_layers, domain, return_dict, timeout, batch_size, method, tot_iter,  parent_init, args):
-    epsilon = 1e-4
+def bab(verif_layers, domain, return_dict, timeout, batch_size, method, tot_iter,  parent_init, args, bab_epsilon=1e-4):
     gurobi_dict = {"gurobi": args.method in ["gurobi", "gurobi-anderson"], "p": args.gurobi_p}
 
     if gpu:
@@ -269,10 +268,10 @@ def bab(verif_layers, domain, return_dict, timeout, batch_size, method, tot_iter
 
     with torch.no_grad():
         min_lb, min_ub, ub_point, nb_states = relu_bab(
-            intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=epsilon,
+            intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=bab_epsilon,
             timeout=timeout, gurobi_dict=gurobi_dict, max_cpu_subdomains=args.max_cpu_subdomains)
 
-    if not (min_lb or min_ub or ub_point):
+    if min_lb is None or min_ub is None:
         return_dict["min_lb"] = None;
         return_dict["min_ub"] = None;
         return_dict["ub_point"] = None;
@@ -334,11 +333,8 @@ def parse_bounding_algorithms(param_dict, cuda_verif_layers, nn_name):
 
 def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, instance_timeout=None,
                   gpu=True, decision_bound=0, start_time=None, max_batches=None, return_bounds_if_timeout=False,
-                  return_ibs_root=False, precomputed_ibs=None):
-
+                  return_ibs_root=False, precomputed_ibs=None, bab_epsilon=1e-4):
     # Pass the parameters for the BaB code via a .json file, rather than through command line arguments.
-    epsilon = 1e-4
-
     if gpu:
         cuda_verif_layers = [copy.deepcopy(lay).cuda() for lay in verif_layers]
         domain = domain.cuda()
@@ -372,14 +368,14 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
 
     with torch.no_grad():
         min_lb, min_ub, ub_point, nb_states = relu_bab(
-            intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=epsilon, ub_method=adv_model,
+            intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=bab_epsilon, ub_method=adv_model,
             timeout=timeout, max_cpu_subdomains=max_cpu_domains, start_time=start_time, early_terminate=early_terminate,
             max_batches=max_batches, return_bounds_if_timeout=return_bounds_if_timeout, return_ibs_root=return_ibs_root,
             precomputed_ibs=precomputed_ibs)
         if return_ibs_root:
             return min_lb, min_ub
 
-    if not (min_lb or min_ub or ub_point):
+    if min_lb is None or min_ub is None:
         return_dict["min_lb"] = None;
         return_dict["min_ub"] = None;
         return_dict["ub_point"] = None;

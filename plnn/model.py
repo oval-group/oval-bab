@@ -1,6 +1,7 @@
 import math
 import torch
-from tools.custom_torch_modules import Flatten, View, Add, supported_transforms
+from tools.custom_torch_modules import Flatten, View, Add, supported_transforms, build_unified_math_transforms, \
+    parse_post_linear_math_transform
 from plnn.naive_approximation import NaiveNetwork
 from torch import nn
 
@@ -51,13 +52,26 @@ COMPS = [GE, LE]
 
 def simplify_network(all_layers):
     '''
-    Given a sequence of Pytorch nn.Module `all_layers`,
-    representing a feed-forward neural network,
-    merge the layers when two sucessive modules are nn.Linear
-    and can therefore be equivalenty computed as a single nn.Linear
+    Given a sequence of Pytorch nn.Module `all_layers` representing a feed-forward neural network,
+    merge the layers when two successive modules are nn.Linear and can hence be computed as a single nn.Linear.
+    Furthermore, incorporate any Add/Mul operation trailing linear/conv2d layers into the layers themselves.
     '''
-    new_all_layers = [all_layers[0]]
-    for layer in all_layers[1:]:
+    temp_layers = []
+    to_skip = 0
+    # first incorporate any add/mul trailing linear/conv2d layers into the linear/conv2d layers themselves
+    for lay_idx, layer in enumerate(all_layers):
+        if to_skip > 0:
+            to_skip -= 1
+            continue
+        if isinstance(layer, nn.Linear) or isinstance(layer, nn.Conv2d):
+            # check if math operations trail this layer
+            post_linear_math_transform, to_skip = build_unified_math_transforms(all_layers[lay_idx + 1:], to_skip)
+            if post_linear_math_transform is not None:
+                layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
+        temp_layers.append(layer)
+
+    new_all_layers = [temp_layers[0]]
+    for layer in temp_layers[1:]:
         if (type(layer) is nn.Linear) and (type(new_all_layers[-1]) is nn.Linear):
             # We can fold together those two layers
             prev_layer = new_all_layers.pop()

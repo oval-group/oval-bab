@@ -479,7 +479,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
             if batch_global_lb <= global_ub:
                 global_lb = batch_global_lb
             elif decision_bound is not None:
-                global_lb = torch.ones_like(global_lb) * prune_value
+                global_lb = torch.ones_like(global_lb) * (
+                    prune_value.to(global_lb.device) if torch.is_tensor(prune_value) else prune_value)
 
         if harder_domains or next_net_buffer:
             harder_domains = bab.prune_domains(harder_domains, prune_value)

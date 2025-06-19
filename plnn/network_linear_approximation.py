@@ -4,9 +4,10 @@ import time
 import torch
 
 from itertools import product
-from tools.custom_torch_modules import View, Flatten, Add, Mul, Reshape
+from tools.custom_torch_modules import Mul, supported_transforms, shape_transforms, Reshape, Flatten, Transpose, \
+    build_unified_math_transforms, parse_post_linear_math_transform, math_transforms
 from plnn.naive_approximation import NaiveNetwork
-from plnn.proxlp_solver.utils import get_relu_mask
+from plnn.proxlp_solver.utils import get_relu_mask, apply_transforms
 from plnn.branch_and_bound.utils import ParentInit
 from torch import nn
 from torch.nn import functional as F
@@ -33,6 +34,7 @@ class LinearizedNetwork(NaiveNetwork):
         self.children_init = ParentInit()
         self.numerical_tolerance = 1e-6
         self.bounds_num_tolerance = 1e-4
+        self.lb_input = None
 
     def get_lower_bound(self, domain, force_optim=False):
         '''
@@ -61,12 +63,11 @@ class LinearizedNetwork(NaiveNetwork):
         layer_with_var_to_opt = self.prerelu_gurobi_vars[node[0]]
         is_batch = (node[1] is None)
 
-        device = self.input_domain.device
         self.lb_input = []  # store lower bound input
 
         # this piece of code assumes that the batch dimension is not there
-        self.lower_bounds = [lbs.to(device).squeeze(0) for lbs in self.lower_bounds]
-        self.upper_bounds = [ubs.to(device).squeeze(0) for ubs in self.upper_bounds]
+        self.lower_bounds = [lbs.to(self.device).squeeze(0) for lbs in self.lower_bounds]
+        self.upper_bounds = [ubs.to(self.device).squeeze(0) for ubs in self.upper_bounds]
 
         # List of time limits per bounds.
         time_limits = copy.copy(time_limit_per_layer)
@@ -122,10 +123,10 @@ class LinearizedNetwork(NaiveNetwork):
                 c_b = opt_model()
 
             # the rest of the code assumes the batch dimension is there
-            self.lower_bounds = [lbs.to(device).unsqueeze(0) for lbs in self.lower_bounds]
-            self.upper_bounds = [ubs.to(device).unsqueeze(0) for ubs in self.upper_bounds]
+            self.lower_bounds = [lbs.to(self.device).unsqueeze(0) for lbs in self.lower_bounds]
+            self.upper_bounds = [ubs.to(self.device).unsqueeze(0) for ubs in self.upper_bounds]
 
-            return torch.tensor(c_b, device=device).unsqueeze(0)
+            return torch.tensor(c_b, device=self.device).unsqueeze(0)
         else:
             print("Batch Gurobi stuff")
             new_lbs = []
@@ -204,14 +205,29 @@ class LinearizedNetwork(NaiveNetwork):
                     # print(f"LB was {curr_lb}, now is {new_lbs[chan_idx, row_idx, col_idx]}")
 
             # the rest of the code assumes the batch dimension is there
-            self.lower_bounds = [lbs.to(device).unsqueeze(0) for lbs in self.lower_bounds]
-            self.upper_bounds = [ubs.to(device).unsqueeze(0) for ubs in self.upper_bounds]
+            self.lower_bounds = [lbs.to(self.device).unsqueeze(0) for lbs in self.lower_bounds]
+            self.upper_bounds = [ubs.to(self.device).unsqueeze(0) for ubs in self.upper_bounds]
 
-            return torch.tensor(new_lbs, device=device).unsqueeze(0), torch.tensor(new_ubs, device=device).unsqueeze(0)
+            return torch.tensor(new_lbs, device=self.device).unsqueeze(0), \
+                torch.tensor(new_ubs, device=self.device).unsqueeze(0)
 
     def get_lower_bound_network_input(self):
-        assert self.layers[-1].out_features == 1
-        return self.lb_input
+        last_lin_layer, _ = self.get_prev_linear_layer(len(self.layers)-1)
+        assert last_lin_layer.out_features == 1
+        # if no lb_input was stored (e.g., timeout), return the input lower bounds as dummy output
+        lb_input = self.lb_input if self.lb_input is not None else self.lower_bounds[0].clone()
+        return apply_transforms(self.input_transforms, lb_input, inverse=True)
+
+    def get_prev_linear_layer(self, layer_idx):
+        sub_idx = 0
+        for sub_idx, prev_layer in enumerate(reversed(self.layers[:layer_idx+1])):
+            if isinstance(prev_layer, math_transforms) or isinstance(prev_layer, nn.ReLU):
+                pass
+            elif isinstance(prev_layer, (nn.Linear, nn.Conv2d)):
+                break
+            else:
+                raise ValueError(f'unexpected operator {prev_layer} after {layer_idx - sub_idx - 1}-th layer')
+        return self.layers[layer_idx - sub_idx], layer_idx - sub_idx
 
     def build_model_using_bounds(self, input_domain, intermediate_bounds, n_threads=1):
         """
@@ -238,15 +254,14 @@ class LinearizedNetwork(NaiveNetwork):
         # Remove preprocessing before the network.
         input_domain = self.handle_net_preprocessing(input_domain)
 
-        self.input_domain = input_domain
+        self.device = input_domain.device
         self.lower_bounds = [lbs.clone() for lbs in intermediate_bounds[0]]
         self.upper_bounds = [ubs.clone() for ubs in intermediate_bounds[1]]
         assert self.lower_bounds[0].dim() <= 3
-        device = self.input_domain.device
         #  Create/edit the variables corresponding to the input layer, which is a special case.
         inp_lbs, inp_ubs, inp_gurobi_vars = self.create_input_variables(input_domain)
-        self.lower_bounds[0] = torch.tensor(inp_lbs, device=device)
-        self.upper_bounds[0] = torch.tensor(inp_ubs, device=device)
+        self.lower_bounds[0] = torch.tensor(inp_lbs, device=self.device)
+        self.upper_bounds[0] = torch.tensor(inp_ubs, device=self.device)
 
         if not self.model_built:
             self.gurobi_x_vars.append(inp_gurobi_vars)
@@ -255,15 +270,20 @@ class LinearizedNetwork(NaiveNetwork):
         ## Create/edit the variables corresponding to the other layers.
         layer_idx = 1
         x_idx = 1
-        for layer in self.layers:
+        to_skip = 0
+        pre_linear_transform = None
+        for lay_idx, layer in enumerate(self.layers):
+            if to_skip > 0:
+                to_skip -= 1
+                continue
             new_layer_gurobi_vars = []
+            if isinstance(layer, (nn.Linear, nn.Conv2d)):
+                # check if math operations trail this layer
+                post_linear_math_transform, to_skip = build_unified_math_transforms(self.layers[lay_idx + 1:], to_skip)
+                if post_linear_math_transform is not None:
+                    layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
             if type(layer) is nn.Linear:
-                pre_vars = self.gurobi_x_vars[x_idx - 1]
-                if self.lower_bounds[x_idx-1].dim() > 1:
-                    pre_vars = []
-                    for chan_idx in range(len(self.gurobi_x_vars[x_idx - 1])):
-                        for row_idx in range(len(self.gurobi_x_vars[x_idx - 1][chan_idx])):
-                            pre_vars.extend(self.gurobi_x_vars[x_idx - 1][chan_idx][row_idx])
+                pre_vars = self.apply_transforms_gurobivars(pre_linear_transform, self.gurobi_x_vars[x_idx - 1])
 
                 for neuron_idx in range(layer.weight.size(0)):
                     if not self.model_built:
@@ -288,10 +308,12 @@ class LinearizedNetwork(NaiveNetwork):
 
                 if not self.model_built:
                     self.prerelu_gurobi_vars.append(new_layer_gurobi_vars)
+                pre_linear_transform = None
             elif type(layer) is nn.Conv2d:
                 assert layer.dilation == (1, 1)
-                pre_lbs = self.lower_bounds[x_idx-1].unsqueeze(0)
+                pre_lbs = apply_transforms(pre_linear_transform, self.lower_bounds[x_idx-1].unsqueeze(0))
                 out_lbs = self.lower_bounds[x_idx].unsqueeze(0)
+                pre_vars = self.apply_transforms_gurobivars(pre_linear_transform, self.gurobi_x_vars[x_idx - 1])
 
                 # The first layer doesn't have any optimization, so it doesn't take any budget
                 for out_chan_idx in range(out_lbs.size(1)):
@@ -317,8 +339,7 @@ class LinearizedNetwork(NaiveNetwork):
                                             coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
                                             if abs(coeff) < self.numerical_tolerance:
                                                 continue
-                                            lin_expr += coeff * self.gurobi_x_vars[x_idx - 1][in_chan_idx][in_row_idx][
-                                                in_col_idx]
+                                            lin_expr += coeff * pre_vars[in_chan_idx][in_row_idx][in_col_idx]
 
                                 pre_lb, pre_ub = self.clamp_bounds_diff(
                                     self.lower_bounds[x_idx][out_chan_idx][out_row_idx][out_col_idx],
@@ -339,6 +360,7 @@ class LinearizedNetwork(NaiveNetwork):
 
                 if not self.model_built:
                     self.prerelu_gurobi_vars.append(new_layer_gurobi_vars)
+                pre_linear_transform = None
             elif type(layer) == nn.ReLU:
                 # print("doing relu")
                 if isinstance(self.prerelu_gurobi_vars[x_idx][0], list):
@@ -425,18 +447,19 @@ class LinearizedNetwork(NaiveNetwork):
                 if not self.model_built:
                     self.gurobi_x_vars.append(new_layer_gurobi_vars)
                 x_idx += 1
-            elif type(layer) == View:
-                continue
-            elif type(layer) == Flatten:
-                continue
+            elif isinstance(layer, shape_transforms):
+                if pre_linear_transform is None:
+                    pre_linear_transform = [layer]
+                else:
+                    pre_linear_transform.append(layer)
             else:
                 raise NotImplementedError
             self.model.update()
             layer_idx += 1
 
         # unsqueeze the bounds to comply with batched SaddleLP
-        self.lower_bounds = [lbs.to(device).unsqueeze(0) for lbs in self.lower_bounds]
-        self.upper_bounds = [ubs.to(device).unsqueeze(0) for ubs in self.upper_bounds]
+        self.lower_bounds = [lbs.to(self.device).unsqueeze(0) for lbs in self.lower_bounds]
+        self.upper_bounds = [ubs.to(self.device).unsqueeze(0) for ubs in self.upper_bounds]
 
         # Remember that the model has been already built, to avoid unnecessary computations when re-using it for BaB.
         self.model_built = True
@@ -453,7 +476,7 @@ class LinearizedNetwork(NaiveNetwork):
         :param n_threads: number of threads to use in the solution of each Gurobi model
         '''
         grb = self.grb
-        self.input_domain = input_domain
+        self.device = input_domain.device
         self.lower_bounds = []
         self.upper_bounds = []
         self.gurobi_x_vars = []
@@ -464,7 +487,6 @@ class LinearizedNetwork(NaiveNetwork):
         self.model = grb.Model()
         self.model.setParam('OutputFlag', False)
         self.model.setParam('Threads', n_threads)
-        device = self.input_domain.device
 
         # List of time limits per bounds.
         time_limits = copy.copy(time_limit_per_layer)
@@ -488,30 +510,33 @@ class LinearizedNetwork(NaiveNetwork):
 
         ## Do the input layer, which is a special case
         inp_lbs, inp_ubs, inp_gurobi_vars = self.create_input_variables(input_domain)
-        self.lower_bounds.append(torch.tensor(inp_lbs, device=device))
-        self.upper_bounds.append(torch.tensor(inp_ubs, device=device))
+        self.lower_bounds.append(torch.tensor(inp_lbs, device=self.device))
+        self.upper_bounds.append(torch.tensor(inp_ubs, device=self.device))
         self.gurobi_x_vars.append(inp_gurobi_vars)
         self.prerelu_gurobi_vars.append(inp_gurobi_vars)
 
         ## Do the other layers, computing for each of the neuron, its upper
         ## bound and lower bound
+        pre_linear_transform = None
         layer_idx = 1
-        for layer in self.layers:
+        to_skip = 0
+        for lay_idx, layer in enumerate(self.layers):
+            if to_skip > 0:
+                to_skip -= 1
+                continue
             is_final = (layer is self.layers[-1])
             new_layer_lb = []
             new_layer_ub = []
             new_layer_gurobi_vars = []
+            if isinstance(layer, (nn.Linear, nn.Conv2d)):
+                # check if math operations trail this layer
+                post_linear_math_transform, to_skip = build_unified_math_transforms(self.layers[lay_idx + 1:], to_skip)
+                if post_linear_math_transform is not None:
+                    layer = parse_post_linear_math_transform(layer, *post_linear_math_transform)
             if type(layer) is nn.Linear:
-                pre_lb = self.lower_bounds[-1]
-                pre_ub = self.upper_bounds[-1]
-                pre_vars = self.gurobi_x_vars[-1]
-                if pre_lb.dim() > 1:
-                    pre_lb = pre_lb.view(-1)
-                    pre_ub = pre_ub.view(-1)
-                    pre_vars = []
-                    for chan_idx in range(len(self.gurobi_x_vars[-1])):
-                        for row_idx in range(len(self.gurobi_x_vars[-1][chan_idx])):
-                            pre_vars.extend(self.gurobi_x_vars[-1][chan_idx][row_idx])
+                pre_lb = apply_transforms(pre_linear_transform, self.lower_bounds[-1].unsqueeze(0)).squeeze(0)
+                pre_ub = apply_transforms(pre_linear_transform, self.upper_bounds[-1].unsqueeze(0)).squeeze(0)
+                pre_vars = self.apply_transforms_gurobivars(pre_linear_transform, self.gurobi_x_vars[-1])
                 if layer_idx > 1:
                     # The previous bounds are from a ReLU
                     pre_lb = torch.clamp(pre_lb, 0, None)
@@ -571,13 +596,17 @@ class LinearizedNetwork(NaiveNetwork):
                     # Report the unused time for the next layer
                     if time_limits:
                         time_limits[0] += max(0, time_used - layer_budget)
-                self.lower_bounds.append(torch.tensor(new_layer_lb, device=device))
-                self.upper_bounds.append(torch.tensor(new_layer_ub, device=device))
+                self.lower_bounds.append(torch.tensor(new_layer_lb, device=self.device))
+                self.upper_bounds.append(torch.tensor(new_layer_ub, device=self.device))
                 self.prerelu_gurobi_vars.append(new_layer_gurobi_vars)
+                pre_linear_transform = None
             elif type(layer) is nn.Conv2d:
                 assert layer.dilation == (1, 1)
-                pre_lb = self.lower_bounds[-1].unsqueeze(0)
-                pre_ub = self.upper_bounds[-1].unsqueeze(0)
+
+                pre_lb = apply_transforms(pre_linear_transform, self.lower_bounds[-1].unsqueeze(0))
+                pre_ub = apply_transforms(pre_linear_transform, self.upper_bounds[-1].unsqueeze(0))
+                pre_vars = self.apply_transforms_gurobivars(pre_linear_transform, self.gurobi_x_vars[-1])
+
                 if layer_idx > 1:
                     # The previous bounds are from a ReLU
                     pre_lb = torch.clamp(pre_lb, 0, None)
@@ -631,7 +660,7 @@ class LinearizedNetwork(NaiveNetwork):
                                             continue
                                         coeff = layer.weight[out_chan_idx, in_chan_idx, ker_row_idx, ker_col_idx].item()
                                         if abs(coeff) > self.numerical_tolerance:
-                                            lin_expr += coeff * self.gurobi_x_vars[-1][in_chan_idx][in_row_idx][in_col_idx]
+                                            lin_expr += coeff * pre_vars[in_chan_idx][in_row_idx][in_col_idx]
 
                             out_lb = out_lbs[0, out_chan_idx, out_row_idx, out_col_idx].item()
                             out_ub = out_ubs[0, out_chan_idx, out_row_idx, out_col_idx].item()
@@ -671,14 +700,15 @@ class LinearizedNetwork(NaiveNetwork):
                     print(f"[GRB] Used {time_used} for layer {layer_idx}")
                     if time_limits:
                         time_limits[0] += max(0, time_used - layer_budget)
-                self.lower_bounds.append(torch.tensor(new_layer_lb, device=device))
-                self.upper_bounds.append(torch.tensor(new_layer_ub, device=device))
+                self.lower_bounds.append(torch.tensor(new_layer_lb, device=self.device))
+                self.upper_bounds.append(torch.tensor(new_layer_ub, device=self.device))
                 self.prerelu_gurobi_vars.append(new_layer_gurobi_vars)
+                pre_linear_transform = None
             elif type(layer) == nn.ReLU:
                 if isinstance(self.gurobi_x_vars[-1][0], list):
                     # This is convolutional
-                    pre_lbs = torch.tensor(self.lower_bounds[-1], device=device)
-                    pre_ubs = torch.tensor(self.upper_bounds[-1], device=device)
+                    pre_lbs = torch.tensor(self.lower_bounds[-1], device=self.device)
+                    pre_ubs = torch.tensor(self.upper_bounds[-1], device=self.device)
                     for chan_idx, channel in enumerate(self.gurobi_x_vars[-1]):
                         chan_vars = []
                         chan_lbs = []
@@ -745,10 +775,11 @@ class LinearizedNetwork(NaiveNetwork):
                             self.model.addConstr(v <= slope.item() * pre_var + bias.item())
 
                         new_layer_gurobi_vars.append(v)
-            elif type(layer) == View:
-                continue
-            elif type(layer) == Flatten:
-                continue
+            elif isinstance(layer, shape_transforms):
+                if pre_linear_transform is None:
+                    pre_linear_transform = [layer]
+                else:
+                    pre_linear_transform.append(layer)
             else:
                 raise NotImplementedError
 
@@ -757,8 +788,8 @@ class LinearizedNetwork(NaiveNetwork):
             layer_idx += 1
 
         # unsqueeze the bounds to comply with batched SaddleLP
-        self.lower_bounds = [torch.tensor(lbs, device=device).unsqueeze(0) for lbs in self.lower_bounds]
-        self.upper_bounds = [torch.tensor(ubs, device=device).unsqueeze(0) for ubs in self.upper_bounds]
+        self.lower_bounds = [torch.tensor(lbs, device=self.device).unsqueeze(0) for lbs in self.lower_bounds]
+        self.upper_bounds = [torch.tensor(ubs, device=self.device).unsqueeze(0) for ubs in self.upper_bounds]
 
         self.model.update()
 
@@ -852,13 +883,22 @@ class LinearizedNetwork(NaiveNetwork):
             out = torch.stack(out, dim=-1)
             return out
         new_layers = []
+        input_transforms = []
         for idx, clayer in enumerate(self.layers):
             if isinstance(clayer, (nn.Linear, nn.Conv2d)):
                 new_layers.extend(self.layers[idx:])
                 break
-            if isinstance(clayer, (Flatten, Mul, Add, Reshape)):
+            elif isinstance(clayer, supported_transforms):
+                if isinstance(clayer, Mul):
+                    # negative multiplications would need a more careful handling of the input bounds
+                    assert (clayer.const >= 0).all()
                 input_domain = input_applier(clayer, input_domain)
+                input_transforms.append(clayer)
+            else:
+                raise NotImplementedError
         self.layers = new_layers
+        self.net = torch.nn.Sequential(*new_layers)
+        self.input_transforms = input_transforms
         return input_domain
 
     def clamp_bounds_diff(self, c_lb, c_ub):
@@ -870,6 +910,37 @@ class LinearizedNetwork(NaiveNetwork):
             if c_lb + self.bounds_num_tolerance >= 0:
                 c_lb = max(0, c_lb)
         return c_lb, c_ub
+
+    def apply_transforms_gurobivars(self, pre_linear_transform, gurobivars):
+        # utility applying shape transforms before linear layers to gurobi vars in the style of apply_transforms
+        newvars = gurobivars
+        if pre_linear_transform is not None:
+            newvars = self.grb.MVar.fromlist(newvars)
+            for transform in pre_linear_transform:
+                if isinstance(transform, Flatten):
+                    newvars = newvars.reshape(-1)
+                elif isinstance(transform, Reshape):
+                    newvars = newvars.reshape(transform.const)
+                elif isinstance(transform, Transpose):
+
+                    shape = newvars.shape
+                    ranges = [range(cx) for cx in shape]
+                    indices = list(product(*ranges))
+
+                    new_shape = torch.ones(shape).permute(transform.perm_shape).shape
+                    new_indices = [tuple(cindices[cx] for cx in transform.perm_shape) for cindices in indices]
+                    temp_vars = torch.ones(new_shape).tolist()
+
+                    for cindices, cnew_indices in zip(indices, new_indices):
+                        temp_vars_entry = temp_vars
+                        for cnew_index in cnew_indices[:-1]:
+                            temp_vars_entry = temp_vars_entry[cnew_index]
+                        temp_vars_entry[cnew_indices[-1]] = newvars[cindices].tolist()
+                    newvars = self.grb.MVar.fromlist(temp_vars)
+                    print(newvars)
+
+            newvars = newvars.tolist()
+        return newvars
 
 
 def optimize_model(model, grb, time_budget):

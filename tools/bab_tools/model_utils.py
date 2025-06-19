@@ -1,7 +1,7 @@
 from torch import nn 
 import torch
 from plnn.model import simplify_network
-from tools.custom_torch_modules import View, Flatten
+from tools.custom_torch_modules import View, Flatten, Mul
 from torch.nn.parameter import Parameter
 import random
 import copy
@@ -315,6 +315,10 @@ def reluified_max_pool(candi_tot, lb_abs, flip_out_sign=False, dtype=torch.float
     by providing linear layers, we reduce consecutive linear layers
     to one
     '''
+    if candi_tot <= 1 and flip_out_sign:
+        # handle corner case
+        return [Mul(torch.tensor([-1.]))]
+
     layers = []
     # perform max-pooling
     # max-pooling is performed in terms of pairs.
@@ -380,6 +384,8 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
         property, create a network encoding a 1 vs. all adversarial verification task.
         The one-vs-all property is encoded exploiting a max-pool layer.
     """
+    if num_classes <= 1:
+        raise ValueError("need at least two classes to create a one_vs_all_from_model")
 
     for p in model.parameters():
         p.requires_grad = False

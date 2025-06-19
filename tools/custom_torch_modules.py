@@ -156,9 +156,14 @@ def parse_post_linear_math_transform(layer, additive, multiplicative):
     assert isinstance(layer, (nn.Linear, nn.Conv2d))
     with torch.no_grad():
         layer = copy.deepcopy(layer)
-        multiplicative = multiplicative.squeeze()
-        additive = additive.squeeze()
-        layer.weight *= multiplicative.view(multiplicative.shape + (1,)*(layer.weight.dim() - multiplicative.dim()))
+        if isinstance(multiplicative, torch.Tensor):
+            multiplicative = multiplicative.squeeze()
+        if isinstance(additive, torch.Tensor):
+            additive = additive.squeeze()
+        if isinstance(multiplicative, torch.Tensor):
+            layer.weight *= multiplicative.view(multiplicative.shape + (1,)*(layer.weight.dim() - multiplicative.dim()))
+        else:
+            layer.weight *= multiplicative
         layer.bias.data = layer.bias.data * multiplicative + additive
     return layer
 

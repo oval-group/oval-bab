@@ -897,7 +897,6 @@ class LinearizedNetwork(NaiveNetwork):
             else:
                 raise NotImplementedError
         self.layers = new_layers
-        self.net = torch.nn.Sequential(*new_layers)
         self.input_transforms = input_transforms
         return input_domain
 

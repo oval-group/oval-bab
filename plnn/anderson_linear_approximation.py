@@ -65,7 +65,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         self.ambiguous_relus = []  # Keep track of which ReLUs are ambiguous.
         self.neurons_per_layer = neurons_per_layer
         self.pending_lower_bound = False
-        self.lb_input = None
+        self.lb_input = None  # NOTE: to use only when computing the last network output bounds
 
         # Keep track of which Gurobi constraints have been added from the exponential family [only for "lp-cut"]
         self.added_exp_constraints = []
@@ -123,6 +123,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         :param intermediate_bounds: (lower_bounds, upper_bounds) each as list of tensors (of size equal to the number
         of ReLU layers, + 1, the input bounds). IMPORTANT: these describe post-activation bounds.
         """
+        self.lb_input = None
         lbs, ubs = intermediate_bounds
         self.lower_bounds = []
         self.upper_bounds = []
@@ -182,7 +183,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         :param upper_bound: (optional) Compute an upper bound instead of a lower bound
         :pram ub_only: (optional) Compute upper bounds only, meaningful only when node[1] = None
         """
-
+        self.lb_input = None
         if not self.lower_bounds:
             raise ValueError("compute_lower_bound called without any bounds stored.")
 
@@ -241,6 +242,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             return preact_lower.unsqueeze(0), preact_upper.unsqueeze(0)
 
     def solve_mip(self, timeout, insert_cuts=True):
+        self.lb_input = None
         grb = self.grb
         # The MIP mode must have been set beforehand.
         assert self.mode == "mip-exact"
@@ -293,6 +295,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         :param n_threads: number of threads to use in the solution of each Gurobi model
         :return: nothing (the upper/lower bounds computation results are stored in self.lower_bounds and self.upper_bounds)
         """
+        self.lb_input = None
         grb = self.grb
         self.device = input_domain[0].device
         # TODO: introduce time limits per bounds as in planet rel (network_linear_approximation, time_limit)
@@ -1048,7 +1051,9 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         if self.model.status in [grb.GRB.INFEASIBLE, grb.GRB.INF_OR_UNBD, grb.GRB.INTERRUPTED, grb.GRB.TIME_LIMIT]:  # (infeasible, interrupted)
             out = float('inf')
             if store_input:
-                self.lb_input = self.lower_bounds[0].clone().unsqueeze(0)  # dummy lower bound input
+                if self.lb_input is None:
+                    # NOTE: the dummmy lower bound will be used when the MILP terminates early as UNSAT
+                    self.lb_input = self.lower_bounds[0].clone().unsqueeze(0)  # dummy lower bound input
         else:
             # We have computed a lower bound
             out = var.X
@@ -1169,7 +1174,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                     # check if this LP solution leads to a negative UB on the global LB (terminate, in case)
                     with torch.no_grad():
                         input_assignment = self.get_input_list(callback_call=True)
-                        out = self.net(input_assignment).squeeze().item()
+                        out = self.evaluate_input(input_assignment)
                         if self.pending_lower_bound:
                             self.lb_input = input_assignment
                     if out < self.decision_boundary:
@@ -1336,8 +1341,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                             assert isinstance(input_vals, grb.tupledict)
                             inps = torch.Tensor([val for val in input_vals.values()])
                             inps = inps.view((1,) + self.lower_bounds[0].shape)
-                        out = self.net(inps).squeeze()
-                        out = out.item()
+                        out = self.evaluate_input(inps)
 
                         if self.pending_lower_bound:
                             self.lb_input = inps
@@ -1660,6 +1664,9 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                         else:
                             mini_inp[i, j, k] = self.gurobi_x_vars[0][i][j][k].x
         return mini_inp.unsqueeze(0)
+
+    def evaluate_input(self, input):
+        return self.net(apply_transforms(self.input_transforms, input, inverse=True)).squeeze().item()
 
     def compute_crown_intercept(self, x_idx):
         # Compute CROWN bounds at layer x_idx (both lower and upper bounds) and return intercept scores at layer x_idx.

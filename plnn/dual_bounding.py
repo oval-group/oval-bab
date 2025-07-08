@@ -3,7 +3,7 @@ from torch.nn import functional as F
 import time, math
 import torch
 
-from plnn.network_linear_approximation import LinearizedNetwork
+from plnn.naive_approximation import NaiveNetwork
 from plnn.proxlp_solver.utils import BatchLinearOp, BatchConvOp, get_relu_mask, compute_output_padding, \
     create_final_coeffs_slice, LinearOp, ConvOp, prod, apply_transforms, CompositeLinearOp, \
     override_numerical_bound_errors
@@ -11,7 +11,7 @@ from tools.custom_torch_modules import shape_transforms, build_unified_math_tran
     parse_post_linear_math_transform, supported_transforms, Mul, math_transforms
 
 
-class DualBounding(LinearizedNetwork):
+class DualBounding(NaiveNetwork):
     """
     Class implementing basic methods re-used by other dual solvers (e.g., creating the layer classes, sub-batching
     over bounds computations, etc).
@@ -510,6 +510,7 @@ class DualBounding(LinearizedNetwork):
     def unbuild(self):
         # Release memory by discarding the stored model information.
         super().unbuild()
+        self.weights = []
         if "bounds_primal" in self.__dict__ and self.bounds_primal is not None:
             self.bounds_primal = []
         if "children_init" in self.__dict__ and self.children_init is not None:

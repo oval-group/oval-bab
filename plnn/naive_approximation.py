@@ -139,6 +139,11 @@ class NaiveNetwork:
         raise NotImplementedError("compute_lower_bound not implemented for naive implementation of IBP for now,"
                                   "use Propagation with type='naive'")
 
+    def unbuild(self):
+        # Release memory by discarding the stored model information.
+        self.lower_bounds = []
+        self.upper_bounds = []
+
     def get_upper_bound_random(self, domain):
         '''
         Compute an upper bound of the minimum of the network on `domain`

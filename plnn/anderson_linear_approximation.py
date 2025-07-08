@@ -4,6 +4,7 @@ from tools.custom_torch_modules import supported_transforms, shape_transforms, b
 from plnn.proxlp_solver.utils import prod, OptimizationTrace, apply_transforms
 from plnn.branch_and_bound.utils import ParentInit
 from plnn.proxlp_solver.solver import SaddleLP
+import gurobipy as grb
 
 from torch import nn
 import torch
@@ -57,9 +58,9 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         self.pending_bound_var = None  # Horrible hack to retrieve relaxed bound value from Gurobi callback.
         self.cut_optimization_calls = 0
         self.lower_bounds = []
-        self.pre_lower_bounds = []
-        self.pre_upper_bounds = []
         self.upper_bounds = []
+        self.postact_lower_bounds = []
+        self.postact_upper_bounds = []
         self.gurobi_x_vars = []
         self.gurobi_z_vars = []
         self.ambiguous_relus = []  # Keep track of which ReLUs are ambiguous.
@@ -121,55 +122,30 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         preactivation_bounds contains the bounds before the ReLU clipping (important to build the model)
         :param input_domain: Tensor containing in each row the lower and upper bound for the corresponding input dimension
         :param intermediate_bounds: (lower_bounds, upper_bounds) each as list of tensors (of size equal to the number
-        of ReLU layers, + 1, the input bounds). IMPORTANT: these describe post-activation bounds.
+        of ReLU layers, + 1, the input bounds).
         """
         self.lb_input = None
         lbs, ubs = intermediate_bounds
         self.lower_bounds = []
         self.upper_bounds = []
-        self.pre_lower_bounds = []
-        self.pre_upper_bounds = []
+        self.postact_lower_bounds = []
+        self.postact_upper_bounds = []
         for x_idx in range(len(lbs)):
             lb = lbs[x_idx]
             ub = ubs[x_idx]
             if x_idx == 0:
+                # these will be filled in within define_linear_approximation
+                self.lower_bounds.append(None)
+                self.upper_bounds.append(None)
+            else:
+                self.postact_lower_bounds.append(torch.clamp(lb, 0, None))
+                self.postact_upper_bounds.append(torch.clamp(ub, 0, None))
                 self.lower_bounds.append(lb.clone())
                 self.upper_bounds.append(ub.clone())
-            else:
-                self.lower_bounds.append(torch.clamp(lb, 0, None))
-                self.upper_bounds.append(torch.clamp(ub, 0, None))
-                self.pre_lower_bounds.append(lb.clone())
-                self.pre_upper_bounds.append(ub.clone())
         x_idx_max = len(lbs) - 1
         self.define_linear_approximation(input_domain, int_bounds_provided=True, compute_final_layer=False,
                                          x_idx_max=x_idx_max, n_threads=n_threads)
         self.model_built = True
-
-    def compute_output_from_intermediate_bounds(self, input_domain, intermediate_bounds):
-        """
-        Build the model using intermediate bounds and compute the bounds for the last layer only.
-        :param input_domain: Tensor containing in each row the lower and upper bound for the corresponding input dimension
-        :param intermediate_bounds: (lower_bounds, upper_bounds) each as list of tensors (of size equal to the number
-        of ReLU layers, + 1, the input bounds). IMPORTANT: these describe post-activation bounds.
-        """
-        lbs, ubs = intermediate_bounds
-        self.lower_bounds = []
-        self.upper_bounds = []
-        self.pre_lower_bounds = []
-        self.pre_upper_bounds = []
-        for x_idx in range(len(lbs)):
-            lb = lbs[x_idx]
-            ub = ubs[x_idx]
-            if x_idx == 0:
-                # these places will be filled in define_linear_approximation
-                self.lower_bounds.append(None)
-                self.upper_bounds.append(None)
-            else:
-                self.lower_bounds.append(torch.clamp(lb, 0, None))
-                self.upper_bounds.append(torch.clamp(ub, 0, None))
-                self.pre_lower_bounds.append(lb.clone())
-                self.pre_upper_bounds.append(ub.clone())
-        self.define_linear_approximation(input_domain, int_bounds_provided=True, compute_final_layer=True)
 
     # Method potentially useful for branch and bound.
     def compute_lower_bound(self, node=(-1, None), upper_bound=False, ub_only=False, counterexample_verification=False):
@@ -243,36 +219,36 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
 
     def solve_mip(self, timeout, insert_cuts=True):
         self.lb_input = None
-        grb = self.grb
         # The MIP mode must have been set beforehand.
         assert self.mode == "mip-exact"
         self.insert_cuts = insert_cuts
 
-        self.global_lb_upper_bound = float("inf")
+        self.global_lb = self.lower_bounds[-1]
 
         if self.lower_bounds[-1].item() > self.decision_boundary:
             print("Early stopping")
-            return (False, None, 0)
+            return (False, self.global_lb, 0)
         if timeout is not None:
             self.model.setParam('TimeLimit', timeout)
 
-        global_lb = self.compute_lower_bound(node=(-1, 0), counterexample_verification=True)
+        lb = self.compute_lower_bound(node=(-1, 0), counterexample_verification=True)
         nb_visited_states = self.model.nodeCount
 
         if self.model.status is grb.GRB.INFEASIBLE:
             # Infeasible: No solution (what's the assumption, here? Feasible so small that there's no counterexample?)
-            return (False, None, nb_visited_states)
+            # Returning inf for consistency with dual-based approaches
+            return (None, float("inf") * torch.ones_like(self.global_lb), nb_visited_states)
 
         elif self.model.status is grb.GRB.OPTIMAL:
             # There is a feasible solution.
-            return (global_lb < self.decision_boundary, global_lb, nb_visited_states)
+            return (lb < self.decision_boundary, lb, nb_visited_states)
 
         elif self.model.status is grb.GRB.INTERRUPTED:
-            return (self.interrupted_sat, None, nb_visited_states)
+            return (self.interrupted_sat, self.global_lb, nb_visited_states)
 
         elif self.model.status is grb.GRB.TIME_LIMIT:
             # We timed out, return a None Status
-            return (None, None, nb_visited_states)
+            return (None, self.global_lb, nb_visited_states)
         else:
             raise Exception("Unexpected Status code")
 
@@ -296,15 +272,14 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         :return: nothing (the upper/lower bounds computation results are stored in self.lower_bounds and self.upper_bounds)
         """
         self.lb_input = None
-        grb = self.grb
         self.device = input_domain[0].device
         # TODO: introduce time limits per bounds as in planet rel (network_linear_approximation, time_limit)
 
         if not int_bounds_provided:
             self.lower_bounds = []
             self.upper_bounds = []
-            self.pre_lower_bounds = []
-            self.pre_upper_bounds = []
+            self.postact_lower_bounds = []
+            self.postact_upper_bounds = []
         elif not (self.lower_bounds and self.upper_bounds):
             raise ValueError("compute_bounds=False but bounds haven't been provided in any way.")
         self.ambiguous_relus = []  # Keep track of which ReLUs are ambiguous.
@@ -338,7 +313,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             self.old_applied_cuts = -1
 
         # Remove preprocessing before the network.
-        input_domain = self.handle_net_preprocessing(input_domain)
+        input_domain, to_skip = self.handle_net_preprocessing(input_domain)
 
         ## Do the input layer, which is a special case
         inp_lbs, inp_ubs, inp_gurobi_vars = self.create_input_variables(input_domain)
@@ -359,6 +334,9 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         x_idx = 1
         pre_linear_transform = None
         for layer_idx, layer in enumerate(self.layers[:-1]):
+            if to_skip > 0:
+                to_skip -= 1
+                continue
             # stop if we've reached x_idx_max
             if x_idx_max > 0 and x_idx > x_idx_max:
                 break
@@ -378,6 +356,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                         self.layers[prev_lay_idx + 1:], 0)
                     if post_linear_math_transform is not None:
                         previous_layer = parse_post_linear_math_transform(previous_layer, *post_linear_math_transform)
+                else:
+                    raise ValueError("no linear layer found before a ReLU")
 
                 if not int_bounds_provided:
                     # Compute upper and lower bounds of the linear part of the layer.
@@ -387,8 +367,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                     preact_lower, preact_upper, preact_vars = self.compute_pre_activation_bounds(
                         x_idx, previous_layer, x_km1_vars)
                 else:
-                    preact_lower = self.pre_lower_bounds[x_idx - 1]
-                    preact_upper = self.pre_upper_bounds[x_idx - 1]
+                    preact_lower = self.lower_bounds[x_idx]
+                    preact_upper = self.upper_bounds[x_idx]
                     preact_vars = self.compute_pre_activation_bounds(x_idx, previous_layer, x_km1_vars, optimize=False)
                 self.model.update()
 
@@ -425,7 +405,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 elif type(previous_layer) is nn.Conv2d:
                     # convolutional layers are dealt with separately to take their structure (and of their input) into account.
 
-                    # Compute interval propagation upper and lower bounds. Used when adding the big-M constraints.
+                    # Compute interval propagation upper and lower bounds.
                     pos_weight = torch.clamp(previous_layer.weight, 0, None)
                     neg_weight = torch.clamp(previous_layer.weight, None, 0)
                     M_minus = (nn.functional.conv2d(l_km1, pos_weight, previous_layer.bias,
@@ -481,10 +461,10 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
 
                 pre_linear_transform = None
                 if not int_bounds_provided:
-                    self.lower_bounds.append(torch.clamp(preact_lower, 0, None))
-                    self.upper_bounds.append(torch.clamp(preact_upper, 0, None))
-                    self.pre_lower_bounds.append(preact_lower)
-                    self.pre_upper_bounds.append(preact_upper)
+                    self.postact_lower_bounds.append(torch.clamp(preact_lower, 0, None))
+                    self.postact_upper_bounds.append(torch.clamp(preact_upper, 0, None))
+                    self.lower_bounds.append(preact_lower)
+                    self.upper_bounds.append(preact_upper)
                 if not self.model_built:
                     self.preact_x_vars.append(preact_vars)
                     self.gurobi_x_vars.append(new_layer_gurobi_x_vars)
@@ -558,14 +538,11 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         :param c_preact_lower: current pre-activation lower bound
         :param c_preact_upper: current pre-activation upper bound
         :param c_preact_var: current pre-activation Gurobi var
-        :param c_m_minus: previous layer interval propagation lower bound
-        :param c_m_plus: previous layer interval propagation upper bound
         :param non_zero_indices_set: set of nonzero indices (possibly a set of tuples for cnn)
         :param powerset: all possible subsets of non_zero_indices_set
         :return: neuron variable, z neuron variable, neuron dual vars, flag for
         whether the ReLU is ambiguous.
         """
-        grb = self.grb
         if type(linear_layer) == nn.Linear:
             neuron_idx = neuron_coordinates
             out_gurobi_format = f"{x_idx}_{neuron_idx}"
@@ -694,7 +671,6 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         :return: pre-activation lower bounds (torch.tensor), pre-activation upper bounds (torch.tensor), list of gurobi
                     variables associated to the linear operation output
         """
-        grb = self.grb
         # store bounds in the format of proxlp/explp for logging purposes.
         out_shape = layer(self.lower_bounds[x_idx-1].unsqueeze(0)).squeeze(0).shape if type(layer) is nn.Conv2d else \
             layer.weight.shape[0]
@@ -740,8 +716,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             # for lp-cut, this computes big-M bounds only, here (and collect them)
             for neuron_idx in neurons:
                 # Avoid numerical instability: on Wide one neuron has ub-lb = 1e-7
-                c_lb = self.pre_lower_bounds[x_idx - 1][neuron_idx]
-                c_ub = self.pre_upper_bounds[x_idx - 1][neuron_idx]
+                c_lb = self.lower_bounds[x_idx][neuron_idx]
+                c_ub = self.upper_bounds[x_idx][neuron_idx]
                 c_lb, c_ub = self.clamp_bounds_diff(c_lb, c_ub)
                 if not self.model_built:
                     lin_expr = self.get_layer_linear_expression(layer, x_km1_vars, neuron_idx, grb)
@@ -887,8 +863,8 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                                      sample_out.size(3) + out_col_idx
 
                         # Avoid numerical instability: on Wide one neuron has ub-lb = 1e-7
-                        c_lb = self.pre_lower_bounds[x_idx - 1][out_chan_idx][out_row_idx][out_col_idx]
-                        c_ub = self.pre_upper_bounds[x_idx - 1][out_chan_idx][out_row_idx][out_col_idx]
+                        c_lb = self.lower_bounds[x_idx][out_chan_idx][out_row_idx][out_col_idx]
+                        c_ub = self.upper_bounds[x_idx][out_chan_idx][out_row_idx][out_col_idx]
                         c_lb, c_ub = self.clamp_bounds_diff(c_lb, c_ub)
                         if not self.model_built:
                             # Compute W_k * x_{k-1} + b_k, as a Gurobi linear expression.
@@ -1039,7 +1015,6 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
     def optimize_var(self, var, gurobi_callback, allowed_statuses, store_input=False):
         # Assuming the objective has already been set, optimize over a variable (providing a gurobi callback for the
         #  MIP case, and the allowed optimization statuses). Returns the var's value at the end of the opt.
-        grb = self.grb
         if self.mode in ["lp-cut", "lp-all"]:
             self.model.optimize()
             assert self.model.status in allowed_statuses
@@ -1070,7 +1045,6 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
             :param out_coordinates: indices related to the current neuron (one index for Linear, a triple for Conv2d)
         :param custom_bias: custom bias instead of b. Not used in this relaxation (i.e., set to 1), but
         :param custom_forward: custom forward pass (passes list of expressions instead of list of variables)
-        employed for instance in the L1 relaxation.
         :return: the Gurobi linear expression
         """
 
@@ -1115,10 +1089,10 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
 
     def get_previous_layer_info(self, x_idx, layer_idx, pre_linear_transform):
         """
-        Get lower bounds, upper bounds, and Gurobi variables relative to the last layer.
+        Get post-act lower bounds, post-act upper bounds, and Gurobi variables relative to the last layer.
         :param x_idx: layer number counting hidden layers (ReLUs not counted)
         :param layer_idx: layer number as in the layer list (counts ReLUs)
-        :return: last layer lower bounds (torch.tensor), upper bounds (torch.tensor), list of gurobi variables
+        :return: post-act layer lower bounds (torch.tensor), post-act upper bounds (torch.tensor), list of gurobi variables
         """
         c_layer = self.layers[layer_idx]
         if layer_idx == 0 and type(c_layer) is nn.ReLU:
@@ -1129,12 +1103,14 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         else:
             linear_layer = c_layer
 
+        clbs = self.postact_lower_bounds[x_idx - 2] if x_idx - 2 >= 0 else self.lower_bounds[0]
+        cubs = self.postact_upper_bounds[x_idx - 2] if x_idx - 2 >= 0 else self.upper_bounds[0]
         if type(linear_layer) is nn.Linear:
-            l_km1 = apply_transforms(pre_linear_transform, self.lower_bounds[x_idx - 1].unsqueeze(0)).squeeze(0)
-            u_km1 = apply_transforms(pre_linear_transform, self.upper_bounds[x_idx - 1].unsqueeze(0)).squeeze(0)
+            l_km1 = apply_transforms(pre_linear_transform, clbs.unsqueeze(0)).squeeze(0)
+            u_km1 = apply_transforms(pre_linear_transform, cubs.unsqueeze(0)).squeeze(0)
         elif type(linear_layer) is nn.Conv2d:
-            l_km1 = apply_transforms(pre_linear_transform, self.lower_bounds[x_idx - 1].unsqueeze(0))
-            u_km1 = apply_transforms(pre_linear_transform, self.upper_bounds[x_idx - 1].unsqueeze(0))
+            l_km1 = apply_transforms(pre_linear_transform, clbs.unsqueeze(0))
+            u_km1 = apply_transforms(pre_linear_transform, cubs.unsqueeze(0))
         else:
             raise ValueError(f"get_previous_layer_info not implemented for {type(linear_layer)} layer")
 
@@ -1148,7 +1124,6 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         :param model: gurobi callback specifications, returns the model (already available in self.model)
         :param where: Gurobi code indicating where callback function is called from
         """
-        grb = self.grb
         allowed_statuses = [grb.GRB.OPTIMAL]
         if counterexample_verification:
             allowed_statuses.extend([grb.GRB.INFEASIBLE, grb.GRB.INF_OR_UNBD])
@@ -1185,6 +1160,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                 # For each layer, neurons are added in decreasing order of violation amount.
                 x_idx = 1
                 pre_linear_transform = None
+                first_linear_done = False
                 # If the threshold has been reached already, no need to add more constraints.
                 if (self.mode == "mip-exact" and self.insert_cuts) or \
                         (self.mode == "lp-cut" and self.applied_cuts < self.cut_treshold):
@@ -1198,12 +1174,15 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                             previous_layer, prev_lay_idx = self.get_prev_linear_layer(layer_idx)
 
                             if isinstance(previous_layer, (nn.Linear, nn.Conv2d)):
+                                first_linear_done = True
                                 # check if math operations trail this layer
                                 post_linear_math_transform, _ = build_unified_math_transforms(
                                     self.layers[prev_lay_idx + 1:], 0)
                                 if post_linear_math_transform is not None:
                                     previous_layer = parse_post_linear_math_transform(
                                         previous_layer, *post_linear_math_transform)
+                            else:
+                                raise ValueError("no linear layer found before a ReLU")
 
                             violation_list = []
                             if type(previous_layer) is nn.Linear:
@@ -1282,7 +1261,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
                                 pre_linear_transform = [layer]
                             else:
                                 pre_linear_transform.append(layer)
-                        elif isinstance(layer, math_transforms):
+                        elif isinstance(layer, math_transforms) and first_linear_done:
                             previous_layer, _ = self.get_prev_linear_layer(layer_idx)
                             if not isinstance(previous_layer, (nn.Conv2d, nn.Linear)):
                                 raise NotImplementedError("mid-network Add and Mul must follow a linear/conv2d layer")
@@ -1313,7 +1292,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         if self.mode == "mip-exact":
             if where == grb.GRB.Callback.MIP:
                 best_bound = model.cbGet(grb.GRB.Callback.MIP_OBJBND)
-                self.global_lb_upper_bound = best_bound
+                self.global_lb = torch.tensor([best_bound])
                 if best_bound > self.decision_boundary:
                     self.interrupted_sat = False  # UNSAT
                     model.terminate()
@@ -1675,9 +1654,7 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         l0_net.set_decomposition('pairs', 'crown')
         l0_net.set_solution_optimizer('init', None)
         domain = torch.stack([self.lower_bounds[0], self.upper_bounds[0]], dim=-1).unsqueeze(0)
-        l0_net.build_model_using_bounds(
-            domain, ([self.lower_bounds[0]] + [clbs.unsqueeze(0) for clbs in self.pre_lower_bounds],
-                     [self.upper_bounds[0]] + [cubs.unsqueeze(0) for cubs in self.pre_upper_bounds]), build_limit=x_idx)
+        l0_net.build_model_using_bounds(domain, (self.lower_bounds, self.upper_bounds), build_limit=x_idx)
         _, _ = l0_net.compute_lower_bound(node=(x_idx, None))
         return l0_net.get_l0_intercept_scores()
 
@@ -1685,19 +1662,19 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
     def get_tight_neuron_set(c_neuron, k, intercept_scores, intermediate_lbs, intermediate_ubs):
         """
         As the rest of Gurobi-based code, assumes the domain batch_size is 1.
-        Computes the set of neurons for which we want to use a tighter ReLU relaxation (Anderson, L1, etc).
+        Computes the set of neurons for which we want to use a tighter ReLU relaxation (Anderson, etc).
         """
-        # Compute L1 sets from intercept scores.
-        L1_set = [[] for lay in range(len(intermediate_lbs))]
+        # Compute tighter sets from intercept scores.
+        tighter_set = [[] for lay in range(len(intermediate_lbs))]
         for lay in range(1, len(intermediate_lbs) - 1):
             clist = []
             cscores = intercept_scores[lay][0][c_neuron]
             ck = min(len(cscores), k)
             for cidx in torch.topk(cscores, ck)[1].tolist():
-                if intermediate_lbs[lay].view(-1)[cidx] <= 0 and intermediate_ubs[lay].view(-1)[cidx] >= 0:
+                if intermediate_lbs[lay].view(-1)[cidx] < 0 and intermediate_ubs[lay].view(-1)[cidx] > 0:
                     clist.append(cidx)
-            L1_set[lay].extend(clist)
-        return L1_set
+            tighter_set[lay].extend(clist)
+        return tighter_set
 
 
 class DualAndersonGurobiVar:

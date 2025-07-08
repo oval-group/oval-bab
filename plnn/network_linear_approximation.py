@@ -11,6 +11,8 @@ from plnn.proxlp_solver.utils import get_relu_mask, apply_transforms
 from plnn.branch_and_bound.utils import ParentInit
 from torch import nn
 from torch.nn import functional as F
+import gurobipy as grb
+
 
 class LinearizedNetwork(NaiveNetwork):
 
@@ -18,8 +20,6 @@ class LinearizedNetwork(NaiveNetwork):
         '''
         layers: A list of Pytorch layers containing only Linear/ReLU/MaxPools
         '''
-        import gurobipy as grb
-        self.grb = grb
         self.layers = layers
         self.net = nn.Sequential(*layers)
         # Skip all gradient computation for the weights of the Net
@@ -59,7 +59,6 @@ class LinearizedNetwork(NaiveNetwork):
         upper_bound: (optional) Compute an upper bound instead of a lower bound
         ub_only: (optional) Compute upper bounds only, meaningful only when node[1] = None
         '''
-        grb = self.grb
         layer_with_var_to_opt = self.prerelu_gurobi_vars[node[0]]
         is_batch = (node[1] is None)
 
@@ -220,13 +219,17 @@ class LinearizedNetwork(NaiveNetwork):
 
     def get_prev_linear_layer(self, layer_idx):
         sub_idx = 0
+        lin_found = False
         for sub_idx, prev_layer in enumerate(reversed(self.layers[:layer_idx+1])):
             if isinstance(prev_layer, math_transforms) or isinstance(prev_layer, nn.ReLU):
                 pass
             elif isinstance(prev_layer, (nn.Linear, nn.Conv2d)):
+                lin_found = True
                 break
             else:
                 raise ValueError(f'unexpected operator {prev_layer} after {layer_idx - sub_idx - 1}-th layer')
+        if not lin_found:
+            raise ValueError(f"there is no linear layer before layer idx {layer_idx}")
         return self.layers[layer_idx - sub_idx], layer_idx - sub_idx
 
     def build_model_using_bounds(self, input_domain, intermediate_bounds, n_threads=1):
@@ -235,7 +238,6 @@ class LinearizedNetwork(NaiveNetwork):
         avoids re-building the model from scratch (but rather adds only the constraints linked to the passed (new)
         input domain or intermediate bounds).
         """
-        grb = self.grb
         if not self.model_built:
             self.gurobi_x_vars = []
             self.prerelu_gurobi_vars = []
@@ -252,7 +254,7 @@ class LinearizedNetwork(NaiveNetwork):
             self.active_planet_constraints = []
 
         # Remove preprocessing before the network.
-        input_domain = self.handle_net_preprocessing(input_domain)
+        input_domain, to_skip = self.handle_net_preprocessing(input_domain)
 
         self.device = input_domain.device
         self.lower_bounds = [lbs.clone() for lbs in intermediate_bounds[0]]
@@ -270,7 +272,6 @@ class LinearizedNetwork(NaiveNetwork):
         ## Create/edit the variables corresponding to the other layers.
         layer_idx = 1
         x_idx = 1
-        to_skip = 0
         pre_linear_transform = None
         for lay_idx, layer in enumerate(self.layers):
             if to_skip > 0:
@@ -475,7 +476,6 @@ class LinearizedNetwork(NaiveNetwork):
                       for the corresponding dimension
         :param n_threads: number of threads to use in the solution of each Gurobi model
         '''
-        grb = self.grb
         self.device = input_domain.device
         self.lower_bounds = []
         self.upper_bounds = []
@@ -501,7 +501,7 @@ class LinearizedNetwork(NaiveNetwork):
             self.model.setParam('Method', 1)  # 1 means dual simplex
 
         # Remove preprocessing before the network.
-        input_domain = self.handle_net_preprocessing(input_domain)
+        input_domain, to_skip = self.handle_net_preprocessing(input_domain)
 
         ## Do the input layer, which is a special case
         zero_var = self.model.addVar(lb=0, ub=0, obj=0,
@@ -519,7 +519,6 @@ class LinearizedNetwork(NaiveNetwork):
         ## bound and lower bound
         pre_linear_transform = None
         layer_idx = 1
-        to_skip = 0
         for lay_idx, layer in enumerate(self.layers):
             if to_skip > 0:
                 to_skip -= 1
@@ -793,12 +792,6 @@ class LinearizedNetwork(NaiveNetwork):
 
         self.model.update()
 
-    def unbuild(self):
-        # Release memory by discarding the stored model information.
-        self.lower_bounds = []
-        self.upper_bounds = []
-        self.weights = []
-
     def create_input_variables(self, input_domain):
         """
         Function to create, given its domain, the Gurobi variables for the network input. These are added to the model.
@@ -806,7 +799,6 @@ class LinearizedNetwork(NaiveNetwork):
         :return: input lower bounds (list), input upper bounds (list), input Gurobi vars (list)
         the dimensionality of the output list depends on whether the input layer is convolutional or linear
         """
-        grb = self.grb
         inp_lbs = []
         inp_ubs = []
         inp_gurobi_vars = []
@@ -884,6 +876,7 @@ class LinearizedNetwork(NaiveNetwork):
             return out
         new_layers = []
         input_transforms = []
+        to_skip = 0
         for idx, clayer in enumerate(self.layers):
             if isinstance(clayer, (nn.Linear, nn.Conv2d)):
                 new_layers.extend(self.layers[idx:])
@@ -894,11 +887,11 @@ class LinearizedNetwork(NaiveNetwork):
                     assert (clayer.const >= 0).all()
                 input_domain = input_applier(clayer, input_domain)
                 input_transforms.append(clayer)
+                to_skip += 1
             else:
                 raise NotImplementedError
-        self.layers = new_layers
         self.input_transforms = input_transforms
-        return input_domain
+        return input_domain, to_skip
 
     def clamp_bounds_diff(self, c_lb, c_ub):
         if (c_ub - c_lb) < self.bounds_num_tolerance:
@@ -914,7 +907,7 @@ class LinearizedNetwork(NaiveNetwork):
         # utility applying shape transforms before linear layers to gurobi vars in the style of apply_transforms
         newvars = gurobivars
         if pre_linear_transform is not None:
-            newvars = self.grb.MVar.fromlist(newvars)
+            newvars = grb.MVar.fromlist(newvars)
             for transform in pre_linear_transform:
                 if isinstance(transform, Flatten):
                     newvars = newvars.reshape(-1)
@@ -935,11 +928,14 @@ class LinearizedNetwork(NaiveNetwork):
                         for cnew_index in cnew_indices[:-1]:
                             temp_vars_entry = temp_vars_entry[cnew_index]
                         temp_vars_entry[cnew_indices[-1]] = newvars[cindices].tolist()
-                    newvars = self.grb.MVar.fromlist(temp_vars)
+                    newvars = grb.MVar.fromlist(temp_vars)
                     print(newvars)
 
             newvars = newvars.tolist()
         return newvars
+
+    def initialize_from(self, external_init):
+        pass
 
 
 def optimize_model(model, grb, time_budget):

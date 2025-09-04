@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 from tools.custom_torch_modules import shape_transforms, build_unified_math_transforms, \
     parse_post_linear_math_transform, supported_transforms, Mul
-from plnn.proxlp_solver.utils import override_numerical_bound_errors
+from plnn.proxlp_solver.utils import override_numerical_bound_errors, apply_transforms
 
 
 class NaiveNetwork:
@@ -24,29 +24,54 @@ class NaiveNetwork:
         self.do_interval_analysis(domain)
         return self.lower_bounds[-1]
 
+    def _find_first_linear(self, domain):
+        # Find first layer.
+        first_layer = 0
+        pre_linear_transform = None
+        for idx, clayer in enumerate(self.layers):
+            if isinstance(clayer, (nn.Linear, nn.Conv2d)):
+                first_layer = idx
+                break
+            elif isinstance(clayer, supported_transforms):
+                if isinstance(clayer, Mul):
+                    # negative multiplications would need a more careful handling of the input bounds
+                    assert (clayer.const >= 0).all()
+                if pre_linear_transform is None:
+                    pre_linear_transform = [clayer]
+                else:
+                    pre_linear_transform.append(clayer)
+
+        # Setup the bounds on the inputs, in the transformed space.
+        self.input_transforms = pre_linear_transform
+        self.input_domain = torch.stack(
+            [apply_transforms(pre_linear_transform, domain.select(-1, 0), no_fold=True),
+             apply_transforms(pre_linear_transform, domain.select(-1, 1), no_fold=True)], dim=-1)
+        l_0 = self.input_domain.select(-1, 0)
+        u_0 = self.input_domain.select(-1, 1)
+        return first_layer, l_0, u_0
+
     def do_interval_analysis(self, inp_domain, override_numerical_errors=False, cdebug=False):
-        self.lower_bounds = []
-        self.upper_bounds = []
-        self.lower_bounds.append(inp_domain.select(-1, 0))
-        self.upper_bounds.append(inp_domain.select(-1, 1))
+
+        first_layer, l_0, u_0 = self._find_first_linear(inp_domain.unsqueeze(0))
+        l_0, u_0 = l_0.squeeze(0), u_0.squeeze(0)
+
+        self.lower_bounds = [-torch.ones_like(l_0)]
+        self.upper_bounds = [torch.ones_like(u_0)]
 
         if cdebug:
-            l_0 = inp_domain.select(-1, 0)
-            u_0 = inp_domain.select(-1, 1)
             inp_ex = (torch.zeros_like(l_0).uniform_() * (u_0 - l_0) + l_0).unsqueeze(0)
             x = inp_ex
 
-        layer_idx = 1
-        current_lb = self.lower_bounds[-1]
-        current_ub = self.upper_bounds[-1]
+        current_lb = l_0
+        current_ub = u_0
         to_skip = 0
-        first_linear_done = False
-        for lay_idx, layer in enumerate(self.layers):
+        start_idx = first_layer
+        for cidx, layer in enumerate(self.layers[start_idx:]):
+            lay_idx = cidx + start_idx
             if to_skip > 0:
                 to_skip -= 1
                 continue
             if isinstance(layer, nn.Linear) or isinstance(layer, nn.Conv2d):
-                first_linear_done = True
                 # check if math operations trail this layer
                 post_linear_math_transform, to_skip = build_unified_math_transforms(self.layers[lay_idx + 1:], to_skip)
                 if post_linear_math_transform is not None:
@@ -107,11 +132,7 @@ class NaiveNetwork:
                 current_ub = new_ubs
                 self.lower_bounds.append(new_lbs)
                 self.upper_bounds.append(new_ubs)
-            elif isinstance(layer, (*shape_transforms, nn.AvgPool2d, nn.ConstantPad2d)) or (
-                    not first_linear_done and isinstance(layer, supported_transforms)):
-                if isinstance(layer, Mul):
-                    # negative multiplications would need a more careful handling of the input bounds
-                    assert (layer.const >= 0).all()
+            elif isinstance(layer, (*shape_transforms, nn.AvgPool2d, nn.ConstantPad2d)):
                 # Simply propagate the operations forward
                 current_lb = layer(current_lb.unsqueeze(0)).squeeze(0)
                 current_ub = layer(current_ub.unsqueeze(0)).squeeze(0)
@@ -128,8 +149,9 @@ class NaiveNetwork:
                                          "use Propagation with type='naive'"
         self.do_interval_analysis(
             inp_domain.squeeze(0), override_numerical_errors=override_numerical_errors, cdebug=cdebug)
-        self.lower_bounds[0] = -torch.ones_like(self.lower_bounds[0])
-        self.upper_bounds[0] = torch.ones_like(self.upper_bounds[0])
+
+        # set self.lower_bounds and self.upper_bounds to the format expected by the other bounding algorithms,
+        # which support batching
         for idx in range(len(self.lower_bounds)):
             self.lower_bounds[idx] = self.lower_bounds[idx].unsqueeze(0)
             self.upper_bounds[idx] = self.upper_bounds[idx].unsqueeze(0)

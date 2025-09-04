@@ -261,7 +261,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
             bab.join_children(gurobi_dict, timeout)
             bab.delete_dumped_domains(dumped_domain_filelblist)
             if return_bounds_if_timeout:
-                return global_lb, global_ub, None, nb_visited_states
+                return global_lb, global_ub, global_ub_point, nb_visited_states
             else:
                 return None, None, None, nb_visited_states
 
@@ -533,7 +533,10 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                 f'early timeout with expected improvement: {expected_improvement} with {t_to_timeout} [s] remaining.')
             bab.join_children(gurobi_dict, timeout)
             bab.delete_dumped_domains(dumped_domain_filelblist)
-            return None, None, None, nb_visited_states
+            if return_bounds_if_timeout:
+                return global_lb, global_ub, global_ub_point, nb_visited_states
+            else:
+                return None, None, None, nb_visited_states
 
         # run attacks
         # Try falsification only in the first 50 batch iterations.

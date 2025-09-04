@@ -367,29 +367,7 @@ class DualBounding(NaiveNetwork):
         self.no_conv = no_conv
         ref_lbs, ref_ubs = intermediate_bounds
 
-        # Find first layer.
-        first_layer = 0
-        pre_linear_transform = None
-        for idx, clayer in enumerate(self.layers):
-            if isinstance(clayer, (nn.Linear, nn.Conv2d)):
-                first_layer = idx
-                break
-            elif isinstance(clayer, supported_transforms):
-                if isinstance(clayer, Mul):
-                    # negative multiplications would need a more careful handling of the input bounds
-                    assert (clayer.const >= 0).all()
-                if pre_linear_transform is None:
-                    pre_linear_transform = [clayer]
-                else:
-                    pre_linear_transform.append(clayer)
-
-        # Setup the bounds on the inputs, in the transformed space.
-        self.input_transforms = pre_linear_transform
-        self.input_domain = torch.stack(
-            [apply_transforms(pre_linear_transform, domain.select(-1, 0), no_fold=True),
-             apply_transforms(pre_linear_transform, domain.select(-1, 1), no_fold=True)], dim=-1)
-        l_0 = self.input_domain.select(-1, 0)
-        u_0 = self.input_domain.select(-1, 1)
+        first_layer, l_0, u_0 = self._find_first_linear(domain)
 
         layer = self.layers[first_layer]
         # check if math operations trail this layer

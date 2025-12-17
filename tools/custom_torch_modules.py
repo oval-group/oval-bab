@@ -138,7 +138,8 @@ def unify_math_transforms(m_transforms, additive, multiplicative):
 def build_unified_math_transforms(layers, to_skip_count):
     operators = []
     for count, clayer in enumerate(layers):
-        if isinstance(clayer, nn.ReLU) or isinstance(clayer, (nn.Linear, nn.Conv2d)):
+        if isinstance(clayer, nn.ReLU) or isinstance(clayer, (nn.Linear, nn.Conv2d)) or \
+                isinstance(clayer, (nn.MaxPool1d, nn.MaxPool2d)):
             break
         if isinstance(clayer, math_transforms):
             operators.append(clayer)

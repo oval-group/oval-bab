@@ -1,7 +1,7 @@
 # OVAL - Branch-and-Bound-based Neural Network Verification
 
 This repository contains PyTorch code for state-of-the-art GPU-accelerated neural network verification based on 
-Branch and Bound (BaB), developed by the [OVAL](https://www.robots.ox.ac.uk/~oval/) research group at the University of Oxford. 
+Branch and Bound (BaB), originally developed by the [OVAL](https://www.robots.ox.ac.uk/~oval/) research group at the University of Oxford and maintained by [Alessandro De Palma](https://www.lse.ac.uk/people/alessandro-de-palma). 
 See the "publications" section below for references.
 
 Complete neural network verification can be cast as a non-convex global minimization problem, which can be solved via BaB.
@@ -132,7 +132,6 @@ where optional layers are enclosed in brackets:
     [reshapings/flattenings] -> [linear] -> [additions/multiplications/reshapings/flattenings]
   
 ## Installation
-The code was implemented assuming to be run under `python3.7`.
 We assume the user's Python environment is based on Anaconda.
 
 ```bash
@@ -141,12 +140,12 @@ git clone --recursive https://github.com/oval-group/oval-bab.git
 cd oval-bab
 
 # Create a conda environment
-conda create -y -n oval python=3.7
+conda create -y -n oval python=3.13
 conda activate oval
 
 # Install pytorch to this virtualenv
 # (or check updated install instructions at http://pytorch.org)
-conda install -y pytorch torchvision cudatoolkit -c pytorch 
+pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu130
 
 # Install the code of this repository
 pip install .

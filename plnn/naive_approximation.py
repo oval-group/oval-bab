@@ -52,14 +52,13 @@ class NaiveNetwork:
 
     def do_interval_analysis(self, inp_domain, override_numerical_errors=False, cdebug=False):
 
-        first_layer, l_0, u_0 = self._find_first_linear(inp_domain.unsqueeze(0))
-        l_0, u_0 = l_0.squeeze(0), u_0.squeeze(0)
+        first_layer, l_0, u_0 = self._find_first_linear(inp_domain)
 
         self.lower_bounds = [-torch.ones_like(l_0)]
         self.upper_bounds = [torch.ones_like(u_0)]
 
         if cdebug:
-            inp_ex = (torch.zeros_like(l_0).uniform_() * (u_0 - l_0) + l_0).unsqueeze(0)
+            inp_ex = (torch.zeros_like(l_0).uniform_() * (u_0 - l_0) + l_0)
             x = inp_ex
 
         current_lb = l_0
@@ -79,13 +78,13 @@ class NaiveNetwork:
 
                 abs_weights = torch.abs(layer.weight)
                 if type(layer) is nn.Linear:
-                    center = torch.mv(layer.weight, current_ub + current_lb) / 2 + layer.bias
-                    offset = torch.mv(abs_weights, current_ub - current_lb) / 2
+                    center = (current_ub + current_lb) @ layer.weight.t() / 2 + layer.bias
+                    offset = (current_ub - current_lb) @ abs_weights.t() / 2
                 else:
-                    center = F.conv2d((current_ub + current_lb).unsqueeze(0) / 2, layer.weight, layer.bias,
-                                      layer.stride, layer.padding, layer.dilation, layer.groups).squeeze(0)
-                    offset = F.conv2d((current_ub - current_lb).unsqueeze(0) / 2, abs_weights, None,
-                                      layer.stride, layer.padding, layer.dilation, layer.groups).squeeze(0)
+                    center = F.conv2d((current_ub + current_lb) / 2, layer.weight, layer.bias,
+                                      layer.stride, layer.padding, layer.dilation, layer.groups)
+                    offset = F.conv2d((current_ub - current_lb) / 2, abs_weights, None,
+                                      layer.stride, layer.padding, layer.dilation, layer.groups)
 
                 new_layer_lb = center - offset
                 new_layer_ub = center + offset
@@ -99,43 +98,17 @@ class NaiveNetwork:
             elif type(layer) == nn.ReLU:
                 current_lb = torch.clamp(current_lb, min=0)
                 current_ub = torch.clamp(current_ub, min=0)
-            elif type(layer) == nn.MaxPool1d:
-                new_layer_lb = []
-                new_layer_ub = []
-                assert layer.padding == 0, "Non supported Maxpool option"
-                assert layer.dilation == 1, "Non supported Maxpool option"
-
-                nb_pre = len(self.lower_bounds[-1])
-                window_size = layer.kernel_size
-                stride = layer.stride
-
-                pre_start_idx = 0
-                pre_window_end = pre_start_idx + window_size
-
-                while pre_window_end <= nb_pre:
-                    lb = max(current_lb[pre_start_idx:pre_window_end])
-                    ub = max(current_ub[pre_start_idx:pre_window_end])
-
-                    new_layer_lb.append(lb)
-                    new_layer_ub.append(ub)
-
-                    pre_start_idx += stride
-                    pre_window_end = pre_start_idx + window_size
-                current_lb = torch.Tensor(new_layer_lb)
-                current_ub = torch.Tensor(new_layer_ub)
-                self.lower_bounds.append(current_lb)
-                self.upper_bounds.append(current_ub)
-            elif type(layer) == nn.MaxPool2d:
-                new_lbs = layer(current_lb.unsqueeze(0)).squeeze(0)
-                new_ubs = layer(current_ub.unsqueeze(0)).squeeze(0)
+            elif isinstance(layer, (nn.MaxPool1d, nn.MaxPool2d)):
+                new_lbs = layer(current_lb)
+                new_ubs = layer(current_ub)
                 current_lb = new_lbs
                 current_ub = new_ubs
                 self.lower_bounds.append(new_lbs)
                 self.upper_bounds.append(new_ubs)
             elif isinstance(layer, (*shape_transforms, nn.AvgPool2d, nn.ConstantPad2d)):
                 # Simply propagate the operations forward
-                current_lb = layer(current_lb.unsqueeze(0)).squeeze(0)
-                current_ub = layer(current_ub.unsqueeze(0)).squeeze(0)
+                current_lb = layer(current_lb)
+                current_ub = layer(current_ub)
             else:
                 raise NotImplementedError
             if cdebug:
@@ -145,16 +118,7 @@ class NaiveNetwork:
             self._debug_forward(inp_ex, x)
 
     def define_linear_approximation(self, inp_domain, override_numerical_errors=False, cdebug=False):
-        assert inp_domain.shape[0] == 1, "IBP does not support domain batching for now, " \
-                                         "use Propagation with type='naive'"
-        self.do_interval_analysis(
-            inp_domain.squeeze(0), override_numerical_errors=override_numerical_errors, cdebug=cdebug)
-
-        # set self.lower_bounds and self.upper_bounds to the format expected by the other bounding algorithms,
-        # which support batching
-        for idx in range(len(self.lower_bounds)):
-            self.lower_bounds[idx] = self.lower_bounds[idx].unsqueeze(0)
-            self.upper_bounds[idx] = self.upper_bounds[idx].unsqueeze(0)
+        self.do_interval_analysis(inp_domain, override_numerical_errors=override_numerical_errors, cdebug=cdebug)
 
     def compute_lower_bound(self, node=(-1, None), upper_bound=False, counterexample_verification=False,
                             override_numerical_errors=False, full_batch_asymmetric=False):

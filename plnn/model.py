@@ -144,8 +144,8 @@ def reluify_maxpool(layers, domain, dtype=torch.float32):
     about upper and lower bounds of certain neurons
     '''
     naive_net = NaiveNetwork(layers)
-    naive_net.do_interval_analysis(domain)
-    lbs = naive_net.lower_bounds
+    naive_net.do_interval_analysis(domain.unsqueeze(0))
+    lbs = [lb.squeeze(0) for lb in naive_net.lower_bounds]
     layers = layers[:]
 
     def prod(lst):

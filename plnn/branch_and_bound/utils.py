@@ -202,7 +202,7 @@ def get_domains_from_file(domains, dumped_domain_filelblist, block_size):
     if len(domains) <= block_size and len(dumped_domain_filelblist) != 0:
         filename = dumped_domain_filelblist[-1][0]
         # Load a block of domains.
-        loaded_doms = torch.load(filename, map_location='cpu')
+        loaded_doms = torch.load(filename, map_location='cpu', weights_only=False)
         os.remove(filename)
         # Insert them in domain list.
         for cdom in loaded_doms:

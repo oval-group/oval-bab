@@ -7,8 +7,6 @@ from tools.bab_tools.model_utils import load_cifar_1to1_exp, load_1toall_eth, \
 from plnn.proxlp_solver.solver import SaddleLP
 from plnn.proxlp_solver.dj_relaxation import DJRelaxationLP
 from plnn.proxlp_solver.propagation import Propagation
-from plnn.network_linear_approximation import LinearizedNetwork
-from plnn.anderson_linear_approximation import AndersonLinearizedNetwork
 from plnn.explp_solver.solver import ExpLP
 from plnn.naive_approximation import NaiveNetwork
 from plnn.branch_and_bound.branching_scores import BranchingChoice
@@ -17,7 +15,6 @@ import time
 import pandas as pd
 import os, copy
 import math
-import torch.multiprocessing as mp
 import csv
 import gc
 import json
@@ -28,7 +25,11 @@ decision_bound = 0
 
 
 def bab(verif_layers, domain, return_dict, timeout, batch_size, method, tot_iter,  parent_init, args, bab_epsilon=1e-4):
-    gurobi_dict = {"gurobi": args.method in ["gurobi", "gurobi-anderson"], "p": args.gurobi_p}
+    gurobi_dict = {"gurobi_out_lbs": args.method in ["gurobi", "gurobi-anderson"], "p": args.gurobi_p}
+
+    if args.method in ["gurobi", "gurobi-anderson"]:
+        from plnn.network_linear_approximation import LinearizedNetwork
+        from plnn.anderson_linear_approximation import AndersonLinearizedNetwork
 
     if gpu:
         cuda_verif_layers = [copy.deepcopy(lay).cuda() for lay in verif_layers]
@@ -240,7 +241,7 @@ def bab(verif_layers, domain, return_dict, timeout, batch_size, method, tot_iter
         'nets': [{
             "net": bounds_net,
             "batch_size": batch_size,
-            "auto_iters": tot_iter == -1 and not gurobi_dict["gurobi"]
+            "auto_iters": tot_iter == -1 and not gurobi_dict["gurobi_out_lbs"]
         }],
         'do_ubs': args.do_ubs,  # whether to compute UBs (can catch more infeasible domains)
         'parent_init': parent_init,  # whether to initialize the dual variables from parent
@@ -249,7 +250,7 @@ def bab(verif_layers, domain, return_dict, timeout, batch_size, method, tot_iter
         out_bounds_dict["nets"].append({
             "net": tighter_bounds_net,
             "batch_size": batch_size if args.hard_batch_size == -1 else args.hard_batch_size,
-            "auto_iters": args.hard_iter == -1 and not gurobi_dict["gurobi"],
+            "auto_iters": args.hard_iter == -1 and not gurobi_dict["gurobi_out_lbs"],
             "hard_overhead": args.hard_overhead,  # assumed at full batch
         })
 
@@ -341,7 +342,7 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
     else:
         cuda_verif_layers = [copy.deepcopy(lay) for lay in verif_layers]
 
-    # TODO: missing json support for gurobi, which also requires a gurobi_dict to be passed -- use CL arguments for now
+    # TODO: missing json support for gurobi out LBs, which also requires a gurobi_dict to be passed -- use CL arguments for now
     timeout = json_params["bab"]["timeout"] if instance_timeout is None else instance_timeout
     # Convert dictionaries specifying bounding algorithms into the corresponding class instances
     parse_bounding_algorithms(json_params, cuda_verif_layers, nn_name)
@@ -355,6 +356,20 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
     if isinstance(branching_dict["max_domains"], dict):
         branching_dict["max_domains"] = branching_dict.pop("max_domains")[nn_name]  # max_domains varies by network
     brancher = BranchingChoice(branching_dict, cuda_verif_layers)
+
+    if "mip_leaves" in json_params and "do_mip_leaves" in json_params["mip_leaves"] and \
+        json_params["mip_leaves"]["do_mip_leaves"]:
+        # use a MILP solver once few ambiguous ReLUs remain
+        from plnn.anderson_linear_approximation import AndersonLinearizedNetwork
+        gurobi_dict = {
+            "gurobi_out_lbs": False,
+            "p": json_params["mip_leaves"]["n_threads"] if "n_threads" in json_params["mip_leaves"] else 1,
+            "mip_n_ambiguous": json_params["mip_leaves"]["mip_n_ambiguous"] if \
+                "mip_n_ambiguous" in json_params["mip_leaves"] else 0,
+            "mip_net": AndersonLinearizedNetwork(verif_layers, mode="mip-exact", decision_boundary=decision_bound)
+        }
+    else:
+        gurobi_dict = None
 
     # upper bounding
     if "upper_bounding" in json_params:
@@ -371,7 +386,7 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
             intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=bab_epsilon, ub_method=adv_model,
             timeout=timeout, max_cpu_subdomains=max_cpu_domains, start_time=start_time, early_terminate=early_terminate,
             max_batches=max_batches, return_bounds_if_timeout=return_bounds_if_timeout, return_ibs_root=return_ibs_root,
-            precomputed_ibs=precomputed_ibs)
+            precomputed_ibs=precomputed_ibs, gurobi_dict=gurobi_dict)
         if return_ibs_root:
             return min_lb, min_ub
 
@@ -617,10 +632,6 @@ def main():
         graph_df = pd.DataFrame(index=indices, columns=columns)
         graph_df.to_pickle(record_name)
 
-    if args.method in ["gurobi", "gurobi-anderson"]:
-        if args.gurobi_p > 1:
-            mp.set_start_method('spawn')  # for some reason, everything hangs w/o this
-
     for new_idx, idx in enum_batch_ids:
 
         torch.cuda.empty_cache()
@@ -711,6 +722,7 @@ def main():
             bab_out, bab_nb_states = bab_output_from_return_dict(return_dict)
         else:
             # Run MIP with Anderson cuts.
+            from plnn.anderson_linear_approximation import AndersonLinearizedNetwork
             if gpu:
                 cuda_verif_layers = [copy.deepcopy(lay).cuda() for lay in verif_layers]
                 domain = domain.cuda()

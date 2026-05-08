@@ -517,15 +517,18 @@ class PropInit(ParentInit):
             stacked_betas = self.do_stack_list(self.betas, stack_size)
         return PropInit(stacked_alphas, parent_gammas=stacked_gammas, parent_betas=stacked_betas)
 
-    def set_stack_parent_entries(self, parent_solution, batch_idx):
+    def set_stack_parent_entries(self, parent_solution, batch_idx, do_branching=True):
         # Given a solution for the parent problem (at batch_idx), set the corresponding entries of the stack.
         for x_idx in range(len(self.alphas)):
-            self.set_parent_entries(self.alphas[x_idx], parent_solution.alphas[x_idx], batch_idx)
+            self.set_parent_entries(
+                self.alphas[x_idx], parent_solution.alphas[x_idx], batch_idx, do_branching=do_branching)
             if self.gammas is not None:
                 for key in self.gammas:
-                    self.set_parent_entries(self.gammas[key][x_idx], parent_solution.gammas[key][x_idx], batch_idx)
+                    self.set_parent_entries(self.gammas[key][x_idx], parent_solution.gammas[key][x_idx],
+                                            batch_idx, do_branching=do_branching)
             if self.betas is not None:
-                self.set_parent_entries(self.betas[x_idx], parent_solution.betas[x_idx], batch_idx)
+                self.set_parent_entries(
+                    self.betas[x_idx], parent_solution.betas[x_idx], batch_idx, do_branching=do_branching)
 
     def get_stack_entry(self, batch_idx):
         # Return the stack entry at batch_idx as a new ParentInit instance.

@@ -237,17 +237,21 @@ class AndersonLinearizedNetwork(LinearizedNetwork):
         if self.model.status is grb.GRB.INFEASIBLE:
             # Infeasible: No solution (what's the assumption, here? Feasible so small that there's no counterexample?)
             # Returning inf for consistency with dual-based approaches
+            self.model_built = False
             return (None, float("inf") * torch.ones_like(self.global_lb), nb_visited_states)
 
         elif self.model.status is grb.GRB.OPTIMAL:
             # There is a feasible solution.
+            self.model_built = False
             return (lb < self.decision_boundary, lb, nb_visited_states)
 
         elif self.model.status is grb.GRB.INTERRUPTED:
+            self.model_built = False
             return (self.interrupted_sat, self.global_lb, nb_visited_states)
 
         elif self.model.status is grb.GRB.TIME_LIMIT:
             # We timed out, return a None Status
+            self.model_built = False
             return (None, self.global_lb, nb_visited_states)
         else:
             raise Exception("Unexpected Status code")

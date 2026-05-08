@@ -3,6 +3,7 @@ from plnn.proxlp_solver.propagation import Propagation, PropInit
 from plnn.explp_solver.bigm_optimization import BigMPInit
 from plnn.explp_solver.solver import ExpLP
 from plnn.proxlp_solver.solver import SaddleLP, DecompositionPInit
+from plnn.branch_and_bound.utils import ParentInit
 import math
 import functools
 
@@ -162,7 +163,6 @@ class BranchingChoice:
                     self.icp_score_counter = 0
             decision_list.append(decision)
 
-            # TODO: should run an LP solver instead
             # ReLUs have all been set, use a scoring for the ambiguous ReLUs.
             if len(all_set_idcs) > 0:
                 for idx in all_set_idcs:
@@ -328,6 +328,9 @@ class BranchingChoice:
         decomposition_check = (isinstance(parent_net, SaddleLP) and isinstance(parent_init, DecompositionPInit))
         if not ((alphabetacrown_check and dtype == "UPB") or
                 ((alphabetacrown_check or as_check or decomposition_check) and dtype == "SUPC")):
+            if isinstance(parent_net, ExpLP) and isinstance(parent_init, ParentInit):
+                # switching to harder domains: use FSB only for these domains that lack init
+                return self.branch_fsb(domains, lower_bounds, upper_bounds)
             # parent_net must be using alpha/beta-CROWN to use UPB: this is the only dual for which it's designed
             raise NotImplementedError("UPB only implemented for alpha/beta-CROWN. SUPC only implemented for "
                                       "alpha/beta-CROWN, AS, Decomposition-based algorithms.")

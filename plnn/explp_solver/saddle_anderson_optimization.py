@@ -817,13 +817,14 @@ class SaddleAndersonInit(anderson_optimization.AndersonPInit):
             stacked_primal_list.append(self.do_stack_list(varset, stack_size))
         return SaddleAndersonInit(bigm_optimization.DualVars(*stacked_dual_list), SaddlePrimalVars(*stacked_primal_list))
 
-    def set_stack_parent_entries(self, parent_solution, batch_idx):
+    def set_stack_parent_entries(self, parent_solution, batch_idx, do_branching=True):
         # Given a solution for the parent problem (at batch_idx), set the corresponding entries of the stack.
-        super().set_stack_parent_entries(parent_solution, batch_idx)
+        super().set_stack_parent_entries(parent_solution, batch_idx, do_branching=do_branching)
         for varname in self.primals.__dict__:
             for x_idx in range(len(self.primals.__dict__[varname])):
                 self.set_parent_entries(self.primals.__dict__[varname][x_idx],
-                                        parent_solution.primals.__dict__[varname][x_idx], batch_idx)
+                                        parent_solution.primals.__dict__[varname][x_idx], batch_idx,
+                                        do_branching=do_branching)
 
     def get_stack_entry(self, batch_idx):
         # Return the stack entry at batch_idx as a new ParentInit instance.

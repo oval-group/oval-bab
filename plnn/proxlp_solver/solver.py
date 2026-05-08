@@ -241,7 +241,6 @@ class SaddleLP(DualBounding):
                         break
 
             # store last dual solution for future usage
-            # TODO: make this compatible with L1 code too
             if isinstance(self.decomposition, ByPairsDecomposition):
                 self.children_init = DecompositionPInit(dual_vars.rhos)
             else:
@@ -791,10 +790,10 @@ class DecompositionPInit(ParentInit):
         stacked_rhos = self.do_stack_list(self.rhos, stack_size)
         return DecompositionPInit(stacked_rhos)
 
-    def set_stack_parent_entries(self, parent_solution, batch_idx):
+    def set_stack_parent_entries(self, parent_solution, batch_idx, do_branching=True):
         # Given a solution for the parent problem (at batch_idx), set the corresponding entries of the stack.
         for x_idx in range(len(self.rhos)):
-            self.set_parent_entries(self.rhos[x_idx], parent_solution.rhos[x_idx], batch_idx)
+            self.set_parent_entries(self.rhos[x_idx], parent_solution.rhos[x_idx], batch_idx, do_branching=do_branching)
 
     def get_stack_entry(self, batch_idx):
         # Return the stack entry at batch_idx as a new ParentInit instance.

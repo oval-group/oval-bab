@@ -571,12 +571,13 @@ class AndersonPInit(ParentInit):
             stacked_dual_list.append(self.do_stack_list(varset, stack_size))
         return AndersonPInit(DualVars(*stacked_dual_list))
 
-    def set_stack_parent_entries(self, parent_solution, batch_idx):
+    def set_stack_parent_entries(self, parent_solution, batch_idx, do_branching=True):
         # Given a solution for the parent problem (at batch_idx), set the corresponding entries of the stack.
         for varname in self.duals.__dict__:
             for x_idx in range(len(self.duals.__dict__[varname])):
                 self.set_parent_entries(self.duals.__dict__[varname][x_idx],
-                                        parent_solution.duals.__dict__[varname][x_idx], batch_idx)
+                                        parent_solution.duals.__dict__[varname][x_idx], batch_idx,
+                                        do_branching=do_branching)
 
     def get_stack_entry(self, batch_idx):
         # Return the stack entry at batch_idx as a new ParentInit instance.

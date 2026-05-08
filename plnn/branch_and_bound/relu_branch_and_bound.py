@@ -94,7 +94,12 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
     `decision_bound`: If not None, stop the search if the UB and LB are both superior or both inferior to this value.
     `batch_size`: The number of domain lower/upper bounds computations done in parallel at once (on a GPU) is
                     batch_size*2
-    `gurobi_dict`: dictionary containing whether ("gurobi") gurobi needs to be used (executes on "p" cpu)
+    `gurobi_dict`: dictionary containing gurobi-related information: whether () gurobi needs to be used (executes on  cpu)
+                 - "gurobi_out_lbs", whether gurobi needs to be used (beyond potential MIP calls, see "mip_net")
+                 - "p", number of cpus over which gurobi is executed in parallel (spawns threads)
+                 - "mip_net", None or an AndersonLinearizedNetwork used as a MIP. Useful to compute tight global UBs
+                              when few ambiguous neurons remain. None disables this.
+                 - "mip_n_ambiguous", number of remaining ambiguous neurons triggering the MIP call
     `early_terminate`: use heuristic for early termination in case of almost certain timeout
     `max_cpu_subdomains`: how many subdomains we can store in cpu memory
     `timeout`: number of seconds for which BaB can run
@@ -127,13 +132,22 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
 
     if gurobi_dict:
         p = gurobi_dict["p"]
-        gurobi = gurobi_dict["gurobi"]
+        gurobi = gurobi_dict["gurobi_out_lbs"]
+        if "mip_net" not in gurobi_dict:
+            gurobi_dict["mip_net"] = None
+        if "mip_n_ambiguous" not in gurobi_dict:
+            gurobi_dict["mip_n_ambiguous"] = 0
     else:
         p = 1
         gurobi = False
-        gurobi_dict = {"gurobi": gurobi, "p": p}
+        gurobi_dict = {"gurobi_out_lbs": gurobi, "p": p, "mip_net": None, "mip_n_ambiguous": 0}
     if gurobi and p > 1:
-        send_nets = bounds_net if stratified_bab else (out_bounds_dict["nets"][0], bounds_net)
+        send_nets = []
+        for cnet in out_bounds_dict["nets"]:
+            send_nets.append(cnet["net"])
+        if gurobi_dict["mip_net"] is not None:
+            send_nets.append(gurobi_dict["mip_net"])
+        send_nets = tuple(send_nets)
         cpu_servers, server_queue, instruction_queue, barrier = bab.spawn_cpu_servers(p, send_nets)
         gurobi_dict.update({'server_queue': server_queue, 'instruction_queue': instruction_queue,
                             'barrier': barrier, 'cpu_servers': cpu_servers})
@@ -216,8 +230,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
     else:
         global_lb, global_ub = bounds_net.compute_lower_bound(counterexample_verification=True)
 
-    # expected improvement from intermediate out LB
-    expected_improvement = torch.zeros_like(intermediate_lbs[-1][0])
+    expected_improvement = torch.zeros_like(global_lb)
     # Stratified bounding related.
     if stratified_bab:
         # Dummy place-holder to avoid switching to harder bounding algorithms before we actually estimate their gain.
@@ -225,7 +238,6 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
 
     intermediate_lbs[-1] = global_lb
     intermediate_ubs[-1] = global_ub
-    bounds_net_device = global_lb.device
     intermediate_net_device = domain.device
 
     # retrieve bounds info from the bounds network
@@ -240,6 +252,16 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         bab.join_children(gurobi_dict, timeout)
         return global_lb, global_ub, global_ub_point, nb_visited_states
 
+    if gurobi_dict["mip_net"] is not None and \
+            bab.get_n_ambiguous(intermediate_lbs, intermediate_ubs).item() <= gurobi_dict["mip_n_ambiguous"]:
+        # run a MILP solver at the root and terminate
+        cpu_domain, cpu_intermediate_lbs, cpu_intermediate_ubs = bab.subproblems_to_cpu(
+            domain.unsqueeze(0), intermediate_lbs, intermediate_ubs, squeeze=True)
+        gurobi_dict["mip_net"].build_model_using_bounds(cpu_domain, (cpu_intermediate_lbs, cpu_intermediate_ubs))
+        _, global_lb, bab_nb_states = gurobi_dict["mip_net"].solve_mip(timeout=timeout, insert_cuts=False)
+        ub_input = gurobi_dict["mip_net"].get_lower_bound_network_input()
+        return global_lb, gurobi_dict["mip_net"].net(ub_input), ub_input, bab_nb_states
+
     candidate_domain = ReLUDomain(global_lb, global_ub, intermediate_lbs, intermediate_ubs,
                                   parent_solution=bounds_net.children_init,
                                   dec_thr=(decision_bound if (decision_bound is not None) else global_ub.cpu()),
@@ -248,12 +270,15 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
     domains = [candidate_domain]
     dumped_domain_filelblist = []  # store filenames and lbs for blocks of domains that are stored on disk
     harder_domains = []
+    mip_domains = []
+    using_mip = False
     next_net_buffer = False
 
     bound_time, branch_time, n_iter, infeasible_count, expans_factor = 0, 0, 0, 0, 2
     while global_ub - global_lb > eps:
         print(f"New batch at {time.time() - start_time}[s]")
         n_iter += 1
+        bounds_net_device = global_lb.device
         # Check if we have run out of time.
         # Timeout a bit earlier than necessary to account for the overhead of exiting the scope.
         if (time.time() - start_time) + 1.10 * (bound_time + branch_time) > timeout or \
@@ -267,14 +292,15 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
 
         domains_str = f"Number of domains {len(domains)}"
         domains_str += f" Number of harder domains {len(harder_domains)}" if stratified_bab else ""
+        domains_str += f" Number of MIP domains {len(mip_domains)}" if gurobi_dict["mip_net"] else ""
         print(domains_str)
         if len(dumped_domain_filelblist) > 0:
             print(f"Number of pickled domains {len(dumped_domain_filelblist) * dumped_domain_blocksize}")
 
         effective_batch_size = min(batch_size, len(domains))
         print(f"effective_batch_size {effective_batch_size}")
+        do_branching = not using_mip  # flag indicating whether these batch of subproblems will be split
 
-        # BRANCHING.
         stack_example = bab.get_subproblem_stacks_entry(
             0, domain.unsqueeze(0), bounds_net.lower_bounds, bounds_net.upper_bounds)
         domain_stack, lbs_stacks, ubs_stacks = bab.create_subproblem_stacks(
@@ -287,7 +313,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
             # Ignore initialization if in the transitioning buffer.
             bounds_net.children_init = bab.ParentInit()
         bounds_net.children_init.to_device(intermediate_net_device)
-        parent_init_stacks = bounds_net.children_init.as_stack(effective_batch_size*2)
+        stack_size = effective_batch_size*2 if do_branching else effective_batch_size
+        parent_init_stacks = bounds_net.children_init.as_stack(stack_size)
 
         # Pick a batch of domains from the subproblem queue.
         for batch_idx in range(effective_batch_size):
@@ -299,10 +326,18 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                                             candidate_domain.lower_all, candidate_domain.upper_all)
 
             # collect branching related information
-            if stratified_bab:
-                parent_lb_list.extend([candidate_domain.lower_bound, candidate_domain.lower_bound])
-                impr_avg_list.extend([candidate_domain.impr_avg, candidate_domain.impr_avg])
-            depth_list.extend([candidate_domain.depth, candidate_domain.depth])
+            if do_branching:
+                # binary branching, hence duplicating entries (one per child)
+                if stratified_bab:
+                    parent_lb_list.extend([candidate_domain.lower_bound, candidate_domain.lower_bound])
+                    impr_avg_list.extend([candidate_domain.impr_avg, candidate_domain.impr_avg])
+                depth_list.extend([candidate_domain.depth, candidate_domain.depth])
+            else:
+                # no branching, no need to duplicate
+                if stratified_bab:
+                    parent_lb_list.append(candidate_domain.lower_bound)
+                    impr_avg_list.append(candidate_domain.impr_avg)
+                depth_list.append(candidate_domain.depth)
 
             # Testnode selection for the quantities related to automatically inferring the number of iters.
             if current_net == 0:
@@ -331,7 +366,7 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                                    next_net_info["hard_overhead"])
             # if doing autoiters, start autostrat only at the max number of iterations for the looser bounds
             auto_iters_check = net_info["max_iters_reached"] or (not use_auto_iters)
-            if evaluate_auto_strat and auto_iters_check:
+            if evaluate_auto_strat and auto_iters_check and not using_mip:
                 # Automatically infer stratification parameters by estimating the hard bounding gain.
                 if not gurobi:
                     bounds_net.initialize_from(copy.deepcopy(candidate_domain.parent_solution))
@@ -358,39 +393,41 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                 next_net_info["lb_impr"] = lb_impr.cpu()
 
             # get parent's dual solution from the candidate domain
-            parent_init_stacks.set_stack_parent_entries(candidate_domain.parent_solution, batch_idx)
+            parent_init_stacks.set_stack_parent_entries(
+                candidate_domain.parent_solution, batch_idx, do_branching=do_branching)
         bounds_net.unbuild()
 
-        # Compute branching choices
-        # TODO: branching will return IndexError in case no ambiguous ReLU is left. Should catch and get the LP solution
-        branch_start = time.time()
-        branching_decision_list = brancher.branch(
-            domain_stack, lbs_stacks, ubs_stacks, parent_net=bounds_net, parent_init=parent_init_stacks)
-        branch_time = time.time() - branch_start
-        print(f"Branching requires {branch_time}[s]")
-
-        # DOMAIN SPLITTING.
-        # Create stacks for the bounding of the split subproblems (duplicates the subdomains, with the two copies for
-        # the i-th subdomain in position 2*i, 2*i + 1.
-        domain_stack, lbs_stacks, ubs_stacks = bab.create_split_stacks(
-            domain_stack, lbs_stacks, ubs_stacks)
-
-        # Dict of sets storing for each layer index, the batch entries that are splitting a ReLU there
+        # Dict of sets storing for each layer index, the batch entries that are splitting a ReLU there.
+        # Initialised to all empty (no splits were carried out yet)
         branching_layer_log = {}
         for idx in range(-1, len(lbs_stacks) - 1):
             branching_layer_log[idx] = set()
 
-        for batch_idx, branching_decision in enumerate(branching_decision_list):
-            branching_layer_log[branching_decision[0]] |= {2*batch_idx, 2*batch_idx+1}
+        if do_branching:
+            # BRANCHING: compute branching choices
+            branch_start = time.time()
+            branching_decision_list = brancher.branch(
+                domain_stack, lbs_stacks, ubs_stacks, parent_net=bounds_net, parent_init=parent_init_stacks)
+            branch_time = time.time() - branch_start
+            print(f"Branching requires {branch_time}[s]")
 
-            # Binary branching.
-            for choice in [0, 1]:
-                # print(f'splitting decision: {branching_decision} - choice {choice}')
-                nb_visited_states += 1
+            # DOMAIN SPLITTING.
+            # Create stacks for the bounding of the split subproblems (duplicates the subdomains, with the two copies for
+            # the i-th subdomain in position 2*i, 2*i + 1).
+            domain_stack, lbs_stacks, ubs_stacks = bab.create_split_stacks(
+                domain_stack, lbs_stacks, ubs_stacks)
 
-                # split the domain with the current branching decision
-                brancher.split_subdomain(
-                    branching_decision, choice, 2*batch_idx + choice, domain_stack, lbs_stacks, ubs_stacks)
+            for batch_idx, branching_decision in enumerate(branching_decision_list):
+                branching_layer_log[branching_decision[0]] |= {2*batch_idx, 2*batch_idx+1}
+
+                # Binary branching.
+                for choice in [0, 1]:
+                    # print(f'splitting decision: {branching_decision} - choice {choice}')
+                    nb_visited_states += 1
+
+                    # split the domain with the current branching decision
+                    brancher.split_subdomain(
+                        branching_decision, choice, 2*batch_idx + choice, domain_stack, lbs_stacks, ubs_stacks)
 
         print(f"Running Nb states visited: {nb_visited_states}")
         print(f"N. infeasible nodes {infeasible_count}")
@@ -400,7 +437,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         dom_ub, dom_lb, dom_ub_point, dom_lb_all, dom_ub_all, dual_solutions, expected_improvement = \
             compute_bounds(intermediate_dict, bounds_net, branching_layer_log, domain_stack, lbs_stacks,
             ubs_stacks, parent_init_stacks, out_bounds_dict["parent_init"], gurobi_dict, expected_improvement,
-            testnode_dict=testnode_dict, compute_last_ubs=out_bounds_dict["do_ubs"], net_info=net_info)
+            testnode_dict=testnode_dict, compute_last_ubs=out_bounds_dict["do_ubs"], net_info=net_info,
+            using_mip=using_mip, timeout=timeout, start_time=start_time, dec_threshold=decision_bound)
 
         # update the global upper bound (if necessary) comparing to the best of the batch
         batch_ub, batch_ub_point_idx = torch.min(dom_ub, dim=0)
@@ -439,8 +477,12 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                         c_dom_lb_all, c_dom_ub_all, parent_solution=c_dual_solutions,
                         parent_depth=depth_list[batch_idx], domain=domain_stack[batch_idx].unsqueeze(0)).to_cpu()
 
+                if gurobi_dict["mip_net"] is not None and not using_mip and \
+                        bab.get_n_ambiguous(c_dom_lb_all, c_dom_ub_all).item() <= gurobi_dict["mip_n_ambiguous"]:
+                    # if a MIP network is provided, use it to verify subdomains with ambiguous neurons below threshold
+                    bab.add_domain(dom_to_add, mip_domains)
                 # if the problem is hard, add "difficult" domains to the hard queue
-                if next_net_info and bab.is_difficult_domain(dom_to_add, next_net_info, expansion=expans_factor):
+                elif next_net_info and bab.is_difficult_domain(dom_to_add, next_net_info, expansion=expans_factor):
                     bab.add_domain(dom_to_add, harder_domains)
                 else:
                     if next_net_buffer:
@@ -449,7 +491,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                     else:
                         bab.add_domain(dom_to_add, domains)
 
-        expans_factor = max(float(added_domains) / (dom_lb.shape[0]/2), 1.0)
+        divider = 2 if do_branching else 1
+        expans_factor = max(float(added_domains) / (dom_lb.shape[0]/divider), 1.0)
         print(f"Batch expansion factor: {expans_factor}")
         bound_time = time.time() - relu_start
         print('A batch of relu splits requires: ', bound_time)
@@ -467,10 +510,16 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         dumped_domain_filelblist = bab.get_domains_from_file(domains, dumped_domain_filelblist, dumped_domain_blocksize)
 
         # Update global LB.
-        if len(domains) + len(harder_domains) > 0:
-            lb_candidate = harder_domains[0] if harder_domains else domains[0]
-            lb_candidate = min(lb_candidate, domains[0]) if domains else lb_candidate
+        if len(domains) + len(harder_domains) + len(mip_domains) > 0:
+
+            # find the lowest LB across the three domains
+            dom_candidate = domains[0] if domains else None
+            harder_candidate = harder_domains[0] if harder_domains else None
+            mip_candidate = mip_domains[0] if mip_domains else None
+            lb_candidate = bab.min_ignoring_none(bab.min_ignoring_none(dom_candidate, harder_candidate), mip_candidate)
             global_lb = lb_candidate.lower_bound.to(bounds_net_device)
+
+            # and compare it with the min across any pickled domains
             if dumped_domain_filelblist:
                 dumped_lb_min = min(dumped_domain_filelblist, key=lambda x: x[1])[1].to(bounds_net_device)
                 global_lb = min(global_lb, dumped_lb_min)
@@ -485,8 +534,11 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
         if harder_domains or next_net_buffer:
             harder_domains = bab.prune_domains(harder_domains, prune_value)
 
+        if mip_domains:
+            mip_domains = bab.prune_domains(mip_domains, prune_value)
+
         # Switch to the harder domains if there's a next net or we're in the transition buffer
-        if len(domains) == 0 and (next_net_info or next_net_buffer):
+        if len(domains) == 0 and (next_net_info or next_net_buffer) and len(harder_domains) > 0:
             domains = harder_domains
             harder_domains = []
             # Check whether it's worth switching network
@@ -510,12 +562,51 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
                         # use a buffer so that when the buffer is empty, we can use the hard problem's parent init
                         next_net_buffer = True
                     if gurobi:
-                        bab.gurobi_switch_bounding_net(gurobi_dict)
+                        bab.gurobi_switch_bounding_net(gurobi_dict, current_net)
                     if use_auto_iters:
                         testnode_dict = None
                 else:
                     # Postpone adding to the harder queue for expected_batches batches.
                     next_net_info["postpone_batches"] = expected_batches
+        elif len(domains) == 0 and (gurobi_dict["mip_net"] is not None) and (not using_mip) and mip_domains:
+            # switch to a MIP for solving the remaining domains
+            print('shifting to a MIP solver for the remaining domains')
+            domains = mip_domains
+            mip_domains = []
+
+            if p > 1:
+                if not gurobi:
+                    # if using multiple threads, spawn them
+                    send_nets = (gurobi_dict["mip_net"],)
+                    cpu_servers, server_queue, instruction_queue, barrier = bab.spawn_cpu_servers(p, send_nets)
+                    gurobi_dict.update({'server_queue': server_queue, 'instruction_queue': instruction_queue,
+                                        'barrier': barrier, 'cpu_servers': cpu_servers})
+                else:
+                    # instruct the other running threads to use the MIP net
+                    bab.gurobi_switch_bounding_net(gurobi_dict, -1)
+
+            using_mip = True
+            gurobi = True
+            gurobi_dict["gurobi_out_lbs"] = True
+            # move global tensors onto CPU for consistency
+            global_ub = global_ub.cpu()
+            global_lb = global_lb.cpu()
+            expected_improvement = expected_improvement.cpu()
+
+            gurobi_dict["mip_net"].lower_bounds = bounds_net.lower_bounds
+            gurobi_dict["mip_net"].upper_bounds = bounds_net.upper_bounds
+
+            mip_net_info = {
+                "nets": [{
+                    "net": gurobi_dict["mip_net"],
+                    "batch_size": batch_size,
+                    "auto_iters": False
+                }],
+                'do_ubs': False,
+                'parent_init': False
+            }
+            out_bounds_dict = mip_net_info
+            bounds_net, net_info, next_net_info, use_auto_iters, batch_size = bab.get_lb_net_info(mip_net_info, 0, 1)
 
         # If early_terminate is True, we return early if we predict that the property won't be verified within the time
         # (if the estimated time to cross the decision threshold + to deplete the bounds goes over the timeout)
@@ -567,7 +658,8 @@ def relu_bab(intermediate_dict, out_bounds_dict, brancher, domain, decision_boun
 
 def compute_bounds(intermediate_dict, bounds_net, branching_layer_log, splitted_domain, splitted_lbs,
                    splitted_ubs, parent_init_stacks, parent_init_flag, gurobi_dict, expected_improvement,
-                   testnode_dict=None, compute_last_ubs=False, net_info=None):
+                   testnode_dict=None, compute_last_ubs=False, net_info=None, using_mip=False, timeout=None,
+                   start_time=None, dec_threshold=None):
     """
     Split domain according to branching decision and compute all the necessary quantities for it.
     Splitting on the input domain will never happen as it'd be done on l1-u1, rather than l0-u0 (representing the
@@ -589,6 +681,10 @@ def compute_bounds(intermediate_dict, bounds_net, branching_layer_log, splitted_
     :param expected_improvement: running avg of the expected improvement over IB last bounds (used for bounding budget).
     :param net_info: information concerning bounds_net (useful to automatically infer the no. of iters)
     :param testnode_dict: dict containing the info for the BaB node used to assess tigthness (used only for auto_iters)
+    :param using_mip: whether we're currently using the MIP solver on the subdomains
+    :param timeout: global timeout in seconds (useful to time out inner MIP calls)
+    :param start_time: start time (useful to time out inner MIP calls)
+    :param dec_threshold: decision threshold (useful to early-stop inner MIP calls)
     """
     # whether to keep the intermediate bounding fixed throughout BaB (after root)
     if not intermediate_dict["fixed_ib"]:
@@ -597,7 +693,7 @@ def compute_bounds(intermediate_dict, bounds_net, branching_layer_log, splitted_
             intermediate_dict, branching_layer_log, splitted_domain, splitted_lbs, splitted_ubs, parent_init_stacks)
 
     # get the new last-layer bounds after the splitting
-    if not gurobi_dict["gurobi"]:
+    if not gurobi_dict["gurobi_out_lbs"]:
 
         # Increase/decrease the number of iterations for the last layer bounding based on expected_improvement.
         if net_info["auto_iters"] and testnode_dict is not None:
@@ -638,7 +734,8 @@ def compute_bounds(intermediate_dict, bounds_net, branching_layer_log, splitted_
     else:
         # compute them one by one
         splitted_lbs, splitted_ubs, dom_ub_point, dual_solutions = compute_last_bounds_cpu(
-            bounds_net, splitted_domain, splitted_lbs, splitted_ubs, gurobi_dict)
+            bounds_net, splitted_domain, splitted_lbs, splitted_ubs, gurobi_dict, using_mip=using_mip, timeout=timeout,
+            start_time=start_time, dec_threshold=dec_threshold)
 
     # retrieve bounds info from the bounds network: the lower bounds are the output of the bound calculation, the upper
     # bounds are computed by evaluating the network at the lower bound points.
@@ -738,7 +835,8 @@ def intermediate_bounds_subroutine(bounding_net, splitted_domain, intermediate_l
         bounding_net.unbuild()
 
 
-def compute_last_bounds_cpu(bounds_net, splitted_domain, splitted_lbs, splitted_ubs, gurobi_dict):
+def compute_last_bounds_cpu(bounds_net, splitted_domain, splitted_lbs, splitted_ubs, gurobi_dict,
+                            using_mip=False, timeout=None, start_time=None, dec_threshold=None):
     # Compute the last layer bounds on (multiple, if p>1) cpu over the batch domains (used for Gurobi).
 
     # Retrieve execution specs.
@@ -752,7 +850,8 @@ def compute_last_bounds_cpu(bounds_net, splitted_domain, splitted_lbs, splitted_
         cpu_splitted_domain, cpu_splitted_lbs, cpu_splitted_ubs = bab.subproblems_to_cpu(
             splitted_domain, splitted_lbs, splitted_ubs)
         splitted_lbs, splitted_ubs, dom_ub_point, dual_solutions = bab.compute_last_bounds_sequentially(
-            bounds_net, cpu_splitted_domain, cpu_splitted_lbs, cpu_splitted_ubs, batch_indices)
+            bounds_net, cpu_splitted_domain, cpu_splitted_lbs, cpu_splitted_ubs, batch_indices, using_mip=using_mip,
+            timeout=timeout, start_time=start_time, dec_threshold=dec_threshold)
     else:
         # Full synchronization after every batch.
         barrier.wait()
@@ -760,31 +859,30 @@ def compute_last_bounds_cpu(bounds_net, splitted_domain, splitted_lbs, splitted_
         cpu_splitted_domain, cpu_splitted_lbs, cpu_splitted_ubs = bab.subproblems_to_cpu(
             splitted_domain, splitted_lbs, splitted_ubs, share=True)
 
-        max_batch_size = cpu_splitted_lbs[0].shape[0]
-        c_batch_size = int(ceil(max_batch_size / float(p)))
-        busy_processors = int(ceil(max_batch_size / float(c_batch_size))) - 1
-        idle_processors = p - (busy_processors+1)
-
-        # Send bounding jobs to the busy cpu servers.
-        for sub_batch_idx in range(busy_processors):
-            start_batch_index = sub_batch_idx * c_batch_size
-            end_batch_index = min((sub_batch_idx + 1) * c_batch_size, max_batch_size)
-            slice_indices = list(range(start_batch_index, end_batch_index))
-            instruction_queue.put((cpu_splitted_domain, cpu_splitted_lbs, cpu_splitted_ubs, slice_indices))
-        # Keep the others idle.
-        for _ in range(idle_processors):
-            instruction_queue.put(("idle",))
+        busy_processors = 0
+        total_batch_size = cpu_splitted_lbs[0].shape[0]
+        for worker_n in range(1, p):
+            is_busy, slice_indices = bab.cpu_subproblem_allocator(worker_n, total_batch_size, p)
+            if is_busy:
+                # Send bounding jobs to the busy cpu servers.
+                instruction_queue.put((cpu_splitted_domain, cpu_splitted_lbs, cpu_splitted_ubs, slice_indices,
+                                       using_mip, timeout, start_time, dec_threshold))
+                busy_processors += 1
+            else:
+                # Keep the others idle.
+                instruction_queue.put(("idle",))
 
         # Execute the last sub-batch of bounds on this cpu core.
-        slice_indices = list(range((busy_processors) * c_batch_size, max_batch_size))
+        _, slice_indices = bab.cpu_subproblem_allocator(0, total_batch_size, p)
         splitted_lbs, splitted_ubs, c_dom_ub_point, c_dual_solutions = bab.compute_last_bounds_sequentially(
-            bounds_net, cpu_splitted_domain, cpu_splitted_lbs, cpu_splitted_ubs, slice_indices, share=True)
+            bounds_net, cpu_splitted_domain, cpu_splitted_lbs, cpu_splitted_ubs, slice_indices, share=True,
+            using_mip=using_mip, timeout=timeout, start_time=start_time, dec_threshold=dec_threshold)
 
         # Gather by-products of bounding in the same format returned by a gpu-batched bounds computation.
-        dom_ub_point = c_dom_ub_point[0].unsqueeze(0).repeat(((max_batch_size,) + (1,) * (c_dom_ub_point.dim() - 1)))
-        dual_solutions = c_dual_solutions.as_stack(max_batch_size)
+        dom_ub_point = c_dom_ub_point[0].unsqueeze(0).repeat(((total_batch_size,) + (1,) * (c_dom_ub_point.dim() - 1)))
+        dual_solutions = c_dual_solutions.as_stack(total_batch_size)
         dom_ub_point[slice_indices] = c_dom_ub_point
-        dual_solutions.set_stack_parent_entries(c_dual_solutions, slice_indices)
+        dual_solutions.set_stack_parent_entries(c_dual_solutions, slice_indices, do_branching=False)
 
         for _ in range(busy_processors):
             # Collect bounding jobs from cpu servers.
@@ -793,7 +891,7 @@ def compute_last_bounds_cpu(bounds_net, splitted_domain, splitted_lbs, splitted_
 
             # Gather by-products of bounding in the same format returned by a gpu-batched bounds computation.
             dom_ub_point[slice_indices] = c_dom_ub_point
-            dual_solutions.set_stack_parent_entries(c_dual_solutions, slice_indices)
+            dual_solutions.set_stack_parent_entries(c_dual_solutions, slice_indices, do_branching=False)
 
     return splitted_lbs, splitted_ubs, dom_ub_point, dual_solutions
 
@@ -813,7 +911,7 @@ def run_attack(ub_method, dom_ub, dom_ub_point, global_ub, global_ub_point):
     if is_adv.sum() > 0:
         print("Found a counter-example.")
 
-    if attack_ub < global_ub:
-        global_ub = attack_ub
-        global_ub_point = attack_point
+    if attack_ub.to(global_ub.device) < global_ub:
+        global_ub = attack_ub.to(global_ub.device)
+        global_ub_point = attack_point.to(global_ub.device)
     return global_ub, global_ub_point

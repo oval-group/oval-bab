@@ -357,11 +357,13 @@ class DJPInit(ParentInit):
         stacked_mus = self.do_stack_list(self.duals.mus, stack_size)
         return DJPInit(DualVarSet(stacked_lambdas, stacked_mus))
 
-    def set_stack_parent_entries(self, parent_solution, batch_idx):
+    def set_stack_parent_entries(self, parent_solution, batch_idx, do_branching=True):
         # Given a solution for the parent problem (at batch_idx), set the corresponding entries of the stack.
         for x_idx in range(len(self.duals.lambdas)):
-            self.set_parent_entries(self.duals.lambdas[x_idx], parent_solution.duals.lambdas[x_idx], batch_idx)
-            self.set_parent_entries(self.duals.mus[x_idx], parent_solution.duals.mus[x_idx], batch_idx)
+            self.set_parent_entries(
+                self.duals.lambdas[x_idx], parent_solution.duals.lambdas[x_idx], batch_idx, do_branching=do_branching)
+            self.set_parent_entries(
+                self.duals.mus[x_idx], parent_solution.duals.mus[x_idx], batch_idx, do_branching=do_branching)
 
     def get_stack_entry(self, batch_idx):
         # Return the stack entry at batch_idx as a new ParentInit instance.

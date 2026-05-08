@@ -97,6 +97,18 @@ python tools/local_robustness_from_onnx.py --network_filename ./models/onnx/cifa
 
 Some details on how to produce a .json configuration file (see `./bab_configs/`) for the OVAL framework can be found at `json_instructions.md`.
 
+#### Running a MILP solver within complete verification
+
+It may be desirable to run a MILP solver within branch-and-bound on subproblems for which only few ambiguous ReLUs remain.
+This is particularly useful when no ambiguous neurons are left, as it may be in practice faster than
+ensuring convergence of dual-based bounding on the underlying linear program.
+See `bab_configs/mip_leaves_example.json` for an example on how to use this functionality through the `mip_leaves` dict in the json file.
+
+#### Running incremental branch-and-bound
+
+Instead of starting from the root, branch-and-bound can be run from the leaves of a previous execution on a similar verification problem. This can result in reduced runtime in certain contexts. A version of the code supporting this is in the `incremental` branch.
+This functionality was included in the context of ["Faster Verified Explanations for Neural Networks"](https://arxiv.org/abs/2512.00164): see the [associated GitHub repository](https://github.com/alessandrodepalma/favex) for example usage.
+
 ### Incomplete verification
 
 All the bounding algorithms contained in the repository share a common interface (see "Incomplete Verifiers" above).
@@ -152,7 +164,7 @@ pip install .
 ```
 
 #### Optional: Gurobi
-In order to run the Gurobi-based solvers (outperformed by dual algorithms on networks with more than 1k neurons), 
+In order to run Gurobi (either as bounding algorithm, as a stand-alone MILP solver, or on branch-and-bound subproblems) 
 a Gurobi license and installation is required.
 
 Gurobi can be obtained from [here](http://www.gurobi.com/downloads/gurobi-optimizer) and academic licenses are available

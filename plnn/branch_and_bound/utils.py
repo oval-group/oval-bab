@@ -4,6 +4,7 @@ import torch.multiprocessing as mp
 import copy
 import traceback
 import os
+import time
 from math import ceil
 from plnn.proxlp_solver.utils import override_numerical_bound_errors
 
@@ -131,6 +132,15 @@ def prune_domains(domains, threshold):
     return domains
 
 
+def min_ignoring_none(arg1, arg2):
+    # A min operator with two args, where None values are ignored: if one of the two args is None, the other is returned
+    if arg1 is None:
+        return arg2
+    if arg2 is None:
+        return arg1
+    return min(arg1, arg2)
+
+
 def create_subproblem_stacks(repeat_size, dom_stack_entry, lbs_stack_entry, ubs_stack_entry, device):
     # Given lists of tensors for lbs and ubs, and input domain, repeat them repeat_size times onto
     # the chosen device
@@ -218,10 +228,11 @@ def delete_dumped_domains(dumped_domain_filelblist):
         os.remove(cfile)
 
 
-def compute_last_bounds_sequentially(bounds_net, splitted_domain, splitted_lbs, splitted_ubs, batch_indices, share=False):
+def compute_last_bounds_sequentially(bounds_net, splitted_domain, splitted_lbs, splitted_ubs, batch_indices,
+                                     share=False, using_mip=False, timeout=None, start_time=None, dec_threshold=None):
     # Compute the last layer bounds sequentially over the batch domains (used for Gurobi).
 
-    for batch_idx in batch_indices:
+    for idx, batch_idx in enumerate(batch_indices):
 
         # Check primal feasibility and don't compute bounds if not satisfied
         clbs = [lbs[batch_idx].unsqueeze(0) for lbs in splitted_lbs]
@@ -234,7 +245,15 @@ def compute_last_bounds_sequentially(bounds_net, splitted_domain, splitted_lbs, 
                 splitted_domain[batch_idx],
                 ([lbs[batch_idx] for lbs in splitted_lbs],
                  [ubs[batch_idx] for ubs in splitted_ubs]))
-            updated_lbs = bounds_net.compute_lower_bound(node=(-1, 0), counterexample_verification=True)
+
+            if not using_mip:
+                updated_lbs = bounds_net.compute_lower_bound(node=(-1, 0), counterexample_verification=True)
+            else:
+                # NOTE: the "-5" allows enough time to detect SATs w/o timing out
+                t_to_timeout = (timeout - 5) - (time.time() - start_time)
+                time_per_mip_call = max(t_to_timeout/(len(batch_indices) - idx), 0.)  # (remaining time) / (remaining calls)
+                _, updated_lbs, _ = bounds_net.solve_mip(timeout=time_per_mip_call, insert_cuts=False)
+
             splitted_lbs[-1][batch_idx] = torch.max(updated_lbs, splitted_lbs[-1][batch_idx])
             c_ub_point = bounds_net.get_lower_bound_network_input().clone()
         else:
@@ -246,6 +265,15 @@ def compute_last_bounds_sequentially(bounds_net, splitted_domain, splitted_lbs, 
         dom_ub_point = c_ub_point if batch_idx == batch_indices[0] else torch.cat([dom_ub_point, c_ub_point], 0)
         if share:
             dom_ub_point = share_tensors(dom_ub_point)
+
+        # early stop sequential MIP calls if any of them finds a counter-example
+        if using_mip and bounds_net.net(c_ub_point) < dec_threshold:
+            # append dummy input LBs to the UB points that are not being computed
+            for sec_batch_idx in batch_indices[idx+1:]:
+                dom_ub_point = torch.cat([dom_ub_point, splitted_domain[sec_batch_idx].select(-1, 0).unsqueeze(0)], 0)
+            if share:
+                dom_ub_point = share_tensors(dom_ub_point)
+            break
 
     # this is a dummy assigment: no parent initialisation for Gurobi (in case it was needed, we'd need a method to
     # concatenate solutions in ParentInit)
@@ -264,6 +292,19 @@ def check_primal_infeasibility(dom_lb_all, dom_ub_all):
     for c_lbs, c_ubs in zip(dom_lb_all, dom_ub_all):
         feasible_output = feasible_output & (c_ubs - c_lbs >= 0).view((*batch_shape, -1)).all(dim=-1, keepdim=True)
     return feasible_output
+
+
+def get_n_ambiguous(dom_lb_all, dom_ub_all):
+    """
+    Given lower/upper bounds (lists of tensors), check the number of ambiguous neurons per batch entry.
+    """
+    if len(dom_lb_all) <= 2:
+        return 0
+    batch_size = dom_lb_all[-2].shape[0]
+    counters = torch.zeros((batch_size,), device=dom_lb_all[-2].device)
+    for c_lbs, c_ubs in zip(dom_lb_all[1:-1], dom_ub_all[1:-1]):
+        counters += ((c_ubs > 0) & (c_lbs < 0)).view(batch_size, -1).sum(-1)
+    return counters
 
 
 def get_lb_net_info(out_bounds_dict, current_net, n_nets):
@@ -385,27 +426,29 @@ def switch_to_hard(hard_domains, criteria_dict, batch_size):
 def last_bounds_cpu_server(pid, bounds_nets, servers_queue, instructions_queue, barrier):
     # Function implementing a CPU process computing last layer bounds (in parallel) until BaB termination is sent.
     try:
+        c_bounds_net = bounds_nets[0]
         while True:
             # Full synchronizatin after every batch.
             barrier.wait()
 
             comm = instructions_queue.get(True)  # blocking get on queue
-            if len(comm) == 1:
+            if len(comm) <= 2:
                 if comm[0] == "terminate":
                     break
                 elif comm[0] == "idle":
                     continue
                 elif comm[0] == "switch_bounds_net":
-                    # Switch to hard bounding network.
-                    bounds_nets = bounds_nets[1]
+                    # Switch to new bounding network.
+                    c_bounds_net = bounds_nets[comm[1]]
                     continue
                 else:
                     raise ChildProcessError(f"Message type not supported: {comm}")
 
-            splitted_domain, splitted_lbs, splitted_ubs, slice_indices = comm
-            c_bounds_net = bounds_nets[0] if type(bounds_nets) is tuple else bounds_nets
+            splitted_domain, splitted_lbs, splitted_ubs, slice_indices, \
+                using_mip, timeout, start_time, dec_threshold = comm
             splitted_lbs, splitted_ubs, dom_ub_point, dual_solutions = compute_last_bounds_sequentially(
-                c_bounds_net, splitted_domain, splitted_lbs, splitted_ubs, slice_indices, share=True)
+                c_bounds_net, splitted_domain, splitted_lbs, splitted_ubs, slice_indices, share=True,
+                using_mip=using_mip, timeout=timeout, start_time=start_time, dec_threshold=dec_threshold)
 
             # Send results to master
             servers_queue.put((splitted_lbs, splitted_ubs, dom_ub_point, dual_solutions, slice_indices))
@@ -418,6 +461,8 @@ def last_bounds_cpu_server(pid, bounds_nets, servers_queue, instructions_queue, 
 
 def spawn_cpu_servers(p, bounds_net):
     # Create child processes to parallelize the last layer bounds computations over cpu. Uses multiprocessing.
+    if mp.get_start_method(allow_none=True) != 'spawn':
+        mp.set_start_method('spawn')  # for some reason, everything hangs w/o this
     servers_queue = mp.Queue()
     instruction_queue = mp.Queue()
     barrier = mp.Barrier(p)
@@ -427,21 +472,21 @@ def spawn_cpu_servers(p, bounds_net):
     return cpu_servers, servers_queue, instruction_queue, barrier
 
 
-def gurobi_switch_bounding_net(gurobi_dict):
+def gurobi_switch_bounding_net(gurobi_dict, net_idx):
     # Instruct the cpu servers (of gurobi-based last layer bounding) to change bounding net
     barrier = gurobi_dict["barrier"]
     instruction_queue = gurobi_dict["instruction_queue"]
     p = gurobi_dict["p"]
     barrier.wait()
     for _ in range(p-1):
-        instruction_queue.put(("switch_bounds_net",))
+        instruction_queue.put(("switch_bounds_net", net_idx))
 
 
 def join_children(gurobi_dict, timeout):
     cpu_servers = gurobi_dict["cpu_servers"]
     barrier = gurobi_dict["barrier"]
     instruction_queue = gurobi_dict["instruction_queue"]
-    gurobi = gurobi_dict["gurobi"]
+    gurobi = gurobi_dict["gurobi_out_lbs"]
     p = gurobi_dict["p"]
 
     if gurobi and p > 1:
@@ -485,6 +530,18 @@ def share_tensors(tensors):
     return tensors
 
 
+def cpu_subproblem_allocator(worker_n, total_batch_size, p):
+    # worker_n is a number in {0, ..., p - 1}, with 0 being the main worker
+    # p is the total number of workers
+    is_busy = 0 <= worker_n <= (min(p, total_batch_size) - 1)
+    if is_busy:
+        slice_indices = [cx for cx in range(total_batch_size) if ((cx % p) == worker_n)]
+    else:
+        slice_indices = []
+    return is_busy, slice_indices
+
+
+
 class ParentInit:
     """
     Abstract class providing all the methods necessary for parent initialisation within the context of Branch and Bound.
@@ -502,7 +559,7 @@ class ParentInit:
         # Repeat the content of this parent init to form a stack of size "stack_size"
         return ParentInit()
 
-    def set_stack_parent_entries(self, parent_solution, batch_idx):
+    def set_stack_parent_entries(self, parent_solution, batch_idx, do_branching=True):
         # Given a solution for the parent problem (at batch_idx), set the corresponding entries of the stack.
         pass
 
@@ -536,10 +593,15 @@ class ParentInit:
         return [x[0].unsqueeze(0).repeat(((stack_size,) + (1,) * (x.dim() - 1))) for x in clist]
 
     @staticmethod
-    def set_parent_entries(x, y, batch_idx):
+    def set_parent_entries(x, y, batch_idx, do_branching=True):
         # Utility function to be used within set_stack_parent_entries
-        x[2 * batch_idx] = y.clone()
-        x[2 * batch_idx + 1] = y.clone()
+        if do_branching:
+            # if branching, two entries to set (one per child)
+            x[2 * batch_idx] = y.clone()
+            x[2 * batch_idx + 1] = y.clone()
+        else:
+            # w/o branching, only one entry to update
+            x[batch_idx] = y.clone()
 
     @staticmethod
     def get_entry_list(clist, batch_idx):

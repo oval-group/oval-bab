@@ -286,7 +286,7 @@ def compute_bounds():
     bab_start = time.time()
     brancher = BranchingChoice(branching_dict, exp_layers)
     with torch.no_grad():
-        min_lb, min_ub, _, nb_states = relu_bab(
+        min_lb, min_ub, _, nb_states, _ = relu_bab(
             intermediate_dict, out_bounds_dict, brancher, exp_domain.squeeze(0), None, timeout=timeout,
             return_bounds_if_timeout=True)
     bab_end = time.time()

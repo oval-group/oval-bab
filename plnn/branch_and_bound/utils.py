@@ -125,11 +125,12 @@ def prune_domains(domains, threshold):
     that have a lower_bound greater than `threshold`
     '''
     # this implementation relies on the domains being sorted according to lower bounds
+    pruned_domains = []
     for i in range(len(domains)):
         if domains[i].lower_bound >= threshold:
-            domains = domains[0:i]
+            domains, pruned_domains = domains[0:i], domains[i:]
             break
-    return domains
+    return domains, pruned_domains
 
 
 def min_ignoring_none(arg1, arg2):
@@ -212,7 +213,7 @@ def get_domains_from_file(domains, dumped_domain_filelblist, block_size):
     if len(domains) <= block_size and len(dumped_domain_filelblist) != 0:
         filename = dumped_domain_filelblist[-1][0]
         # Load a block of domains.
-        loaded_doms = torch.load(filename, map_location='cpu', weights_only=False)
+        loaded_doms = torch.load(filename, map_location='cpu')
         os.remove(filename)
         # Insert them in domain list.
         for cdom in loaded_doms:

@@ -268,7 +268,7 @@ def bab(verif_layers, domain, return_dict, timeout, batch_size, method, tot_iter
     brancher = BranchingChoice(branching_dict, cuda_verif_layers)
 
     with torch.no_grad():
-        min_lb, min_ub, ub_point, nb_states = relu_bab(
+        min_lb, min_ub, ub_point, nb_states, _ = relu_bab(
             intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=bab_epsilon,
             timeout=timeout, gurobi_dict=gurobi_dict, max_cpu_subdomains=args.max_cpu_subdomains)
 
@@ -334,7 +334,8 @@ def parse_bounding_algorithms(param_dict, cuda_verif_layers, nn_name):
 
 def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, instance_timeout=None,
                   gpu=True, decision_bound=0, start_time=None, max_batches=None, return_bounds_if_timeout=False,
-                  return_ibs_root=False, precomputed_ibs=None, bab_epsilon=1e-4):
+                  return_ibs_root=False, precomputed_ibs=None, leaves_branching_history_list=None, store_history=False,
+                  bab_epsilon=1e-4):
     # Pass the parameters for the BaB code via a .json file, rather than through command line arguments.
     if gpu:
         cuda_verif_layers = [copy.deepcopy(lay).cuda() for lay in verif_layers]
@@ -382,11 +383,12 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
         adv_model = None
 
     with torch.no_grad():
-        min_lb, min_ub, ub_point, nb_states = relu_bab(
+        min_lb, min_ub, ub_point, nb_states, leaves_branching_history_list = relu_bab(
             intermediate_dict, out_bounds_dict, brancher, domain, decision_bound, eps=bab_epsilon, ub_method=adv_model,
             timeout=timeout, max_cpu_subdomains=max_cpu_domains, start_time=start_time, early_terminate=early_terminate,
             max_batches=max_batches, return_bounds_if_timeout=return_bounds_if_timeout, return_ibs_root=return_ibs_root,
-            precomputed_ibs=precomputed_ibs, gurobi_dict=gurobi_dict)
+            precomputed_ibs=precomputed_ibs, leaves_branching_history_list=leaves_branching_history_list,
+            store_history=store_history, gurobi_dict=gurobi_dict)
         if return_ibs_root:
             return min_lb, min_ub
 
@@ -401,6 +403,7 @@ def bab_from_json(json_params, verif_layers, domain, return_dict, nn_name, insta
         return_dict["min_ub"] = min_ub.cpu()
         return_dict["ub_point"] = ub_point.cpu() if ub_point is not None else None
         return_dict["nb_states"] = nb_states
+        return_dict["leaves_branching_history_list"] = leaves_branching_history_list
 
 
 def bab_output_from_return_dict(return_dict):

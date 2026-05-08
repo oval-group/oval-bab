@@ -60,6 +60,7 @@ The OVAL framework was developed as part of the following publications:
 - ["Scaling the Convex Barrier with Active Sets"](https://openreview.net/forum?id=uQfOy7LrlTR);
 - ["Scaling the Convex Barrier with Sparse Dual Algorithms"](https://arxiv.org/abs/2101.05844);
 - ["Improved Branch and Bound for Neural Network Verification via Lagrangian Decomposition"](https://arxiv.org/abs/2104.06718).
+- ["Faster Verified Explanations for Neural Networks"](https://arxiv.org/abs/2512.00164), for incremental branch-and-bound.
 
 If you use our code in your research, please cite the papers associated to the employed algorithms, along with 
 ([Bunel et al. 2020a](http://www.jmlr.org/papers/v21/19-468.html)) and 
@@ -106,8 +107,10 @@ See `bab_configs/mip_leaves_example.json` for an example on how to use this func
 
 #### Running incremental branch-and-bound
 
-Instead of starting from the root, branch-and-bound can be run from the leaves of a previous execution on a similar verification problem. This can result in reduced runtime in certain contexts. A version of the code supporting this is in the `incremental` branch.
-This functionality was included in the context of ["Faster Verified Explanations for Neural Networks"](https://arxiv.org/abs/2512.00164): see the [associated GitHub repository](https://github.com/alessandrodepalma/favex) for example usage.
+Instead of starting from the root, branch-and-bound can be run from the leaves of a previous execution on a similar verification problem.
+This can result in reduced runtime in certain contexts.
+The code supports this by passing a non-`None` `leaves_branching_history_list` to `relu_bab` (`bab_from_json` within `tools/bab_tools/bab_runner.py` provides an interface for this).
+The list from an execution is the last return value of `relu_bab`.
 
 ### Incomplete verification
 

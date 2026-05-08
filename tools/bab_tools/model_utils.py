@@ -376,6 +376,24 @@ def reluified_max_pool(candi_tot, lb_abs, flip_out_sign=False, dtype=torch.float
 
     return layers
 
+def _get_diff_layer(layers, true_label, num_classes=10, gt_minus_other=False):
+    last_layer = layers[-1]
+    diff_in = last_layer.out_features
+    diff_out = last_layer.out_features - 1
+    diff_layer = nn.Linear(diff_in, diff_out, bias=True)
+    temp_weight_diff = torch.eye(num_classes)
+    temp_weight_diff[:, true_label] -= 1
+    all_indices = list(range(num_classes))
+    all_indices.remove(true_label)
+    weight_diff = temp_weight_diff[all_indices]
+    bias_diff = torch.zeros(num_classes - 1)
+    if gt_minus_other:
+        weight_diff = -weight_diff
+    diff_layer.weight = Parameter(weight_diff, requires_grad=False)
+    diff_layer.bias = Parameter(bias_diff, requires_grad=False)
+    layers.append(diff_layer)
+    return simplify_network(layers), diff_out
+
 
 def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000, use_ib=False, gpu=True,
                           num_classes=10):
@@ -391,21 +409,7 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
         p.requires_grad = False
     layers = list(model.children())
 
-    last_layer = layers[-1]
-    diff_in = last_layer.out_features
-    diff_out = last_layer.out_features - 1
-    diff_layer = nn.Linear(diff_in, diff_out, bias=True)
-    temp_weight_diff = torch.eye(num_classes)
-    temp_weight_diff[:, true_label] -= 1
-    all_indices = list(range(num_classes))
-    all_indices.remove(true_label)
-    weight_diff = temp_weight_diff[all_indices]
-    bias_diff = torch.zeros(num_classes-1)
-
-    diff_layer.weight = Parameter(weight_diff, requires_grad=False)
-    diff_layer.bias = Parameter(bias_diff, requires_grad=False)
-    layers.append(diff_layer)
-    layers = simplify_network(layers)
+    layers, diff_out = _get_diff_layer(layers, true_label, num_classes=num_classes)
 
     verif_layers = [copy.deepcopy(lay).cuda() for lay in layers] if gpu else layers
     if not use_ib:
@@ -430,6 +434,14 @@ def one_vs_all_from_model(model, true_label, domain=None, max_solver_batch=10000
 
     final_layers = layers[:-1] + simplified_layers
     return final_layers
+
+
+def convert_to_logit_differences(model, true_label, num_classes=10, gt_minus_other=False):
+    for p in model.parameters():
+        p.requires_grad = False
+    layers = list(model.children())
+    layers, diff_out = _get_diff_layer(layers, true_label, num_classes=num_classes, gt_minus_other=gt_minus_other)
+    return layers
 
 
 def normalize(image, dataset):

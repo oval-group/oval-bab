@@ -7,6 +7,7 @@ from plnn.branch_and_bound.utils import ParentInit
 
 default_params = {
     'nb_steps': 5,
+    'max_steps': 100,
     'initial_step_size': 1e0,
     'step_size_decay': 0.98,
     'betas': (0.9, 0.999),
@@ -379,7 +380,7 @@ class Propagation(DualBounding):
             self.min_steps = self.get_iters()
         else:
             self.min_steps = 0
-        self.max_steps = 100
+        self.max_steps = self.params["max_steps"]
         self.step_increase = 5
         self.set_iters(self.min_steps)
 
